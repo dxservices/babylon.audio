@@ -18,7 +18,9 @@ FORBIDDEN_SOURCE_TERMS = {
     "UserDefaults",
     "SwiftUI",
     "URLSessionWebSocket",
+    "Logger",
 }
+CONTENT_BEARING_TERMS = re.compile(r"\b(?:Codable|Data|Error|String)\b")
 
 
 def repository_text_files():
@@ -46,6 +48,23 @@ for file_path in source_root.rglob("*.swift"):
         if term in text:
             fail(f"Forbidden boundary term {term!r} found in {file_path.relative_to(ROOT)}")
 
+observability_contract = source_root / "AudioObservability.swift"
+if observability_contract.exists():
+    text = observability_contract.read_text(encoding="utf-8")
+    match = CONTENT_BEARING_TERMS.search(text)
+    if match:
+        fail(
+            "Content-bearing term "
+            f"{match.group(0)!r} found in {observability_contract.relative_to(ROOT)}"
+        )
+
+frame_contract = source_root / "AudioContracts.swift"
+if frame_contract.exists() and re.search(
+    r"\b(?:Codable|Encodable|Decodable)\b",
+    frame_contract.read_text(encoding="utf-8"),
+):
+    fail("Persistence conformance found in the audio frame contract")
+
 if (ROOT / ".git").exists():
     result = subprocess.run(
         ["git", "log", "-1", "--pretty=%B"],
@@ -58,4 +77,3 @@ if (ROOT / ".git").exists():
         fail("Non-English CJK text found in the latest commit message")
 
 print("Repository language and source-boundary checks passed.")
-
