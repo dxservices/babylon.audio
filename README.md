@@ -2,7 +2,8 @@
 
 BabylonAudio is an iOS real-time audio data-plane and device-management Swift package.
 
-The package is in its initial pre-0.1 scaffold. It does not expose a usable public API yet.
+The package is pre-0.1 and its provider-neutral contracts and bounded audio core
+are under active development.
 
 ## Requirements
 
@@ -14,6 +15,15 @@ The package is in its initial pre-0.1 scaffold. It does not expose a usable publ
 ## Adoption requirement
 
 BabylonAudio must be the sole authority for `AVAudioSession` configuration and the hardware `AVAudioEngine` graph in a consuming process. Applications and SDK adapters must not create a competing audio-session or hardware-engine owner.
+
+Frame timestamps are flow-relative media or capture positions, not wall-clock
+or queue-entry times. Queue age and jitter-buffer freshness must use separately
+recorded local monotonic enqueue or receive instants.
+
+`PCMFrameConverter` keeps resampling state for one flow and format tuple. A
+consumer must call `reset()` after stop and before flow replacement or input
+format change. Reset discards filter history; the converter uses no priming tail,
+so there is no output to flush.
 
 ## Intended responsibilities
 
@@ -50,4 +60,3 @@ Simulator and unit-test results do not prove Bluetooth routing, private-output s
 ## License
 
 BabylonAudio is available under the MIT License. See `LICENSE`.
-

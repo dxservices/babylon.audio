@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parent.parent
 IGNORED_PARTS = {".build", ".git", ".swiftpm"}
 CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 TEXT_SUFFIXES = {".md", ".py", ".swift", ".yml", ".yaml"}
+TEXT_NAMES = {"Package.swift", "AGENTS.md", "LICENSE", ".gitignore"}
 FORBIDDEN_SOURCE_TERMS = {
     "OpenAI",
     "Google",
@@ -27,7 +28,11 @@ def repository_text_files():
     for path in ROOT.rglob("*"):
         if not path.is_file() or any(part in IGNORED_PARTS for part in path.parts):
             continue
-        if path.suffix in TEXT_SUFFIXES or path.name in {"Package.swift", "AGENTS.md"}:
+        if path.suffix in TEXT_SUFFIXES or path.name in TEXT_NAMES or path.suffix == "":
+            try:
+                path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
             yield path
 
 
@@ -66,14 +71,28 @@ if frame_contract.exists() and re.search(
     fail("Persistence conformance found in the audio frame contract")
 
 if (ROOT / ".git").exists():
-    result = subprocess.run(
-        ["git", "log", "-1", "--pretty=%B"],
+    shallow_result = subprocess.run(
+        ["git", "rev-parse", "--is-shallow-repository"],
         cwd=ROOT,
         check=False,
         capture_output=True,
         text=True,
     )
-    if result.returncode == 0 and CJK.search(result.stdout):
-        fail("Non-English CJK text found in the latest commit message")
+    if shallow_result.returncode != 0:
+        fail("Unable to determine whether repository history is shallow")
+    if shallow_result.stdout.strip() == "true":
+        fail("Shallow history cannot prove English-only commit messages from the first commit")
+
+    result = subprocess.run(
+        ["git", "log", "--all", "--format=%B"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        fail("Unable to inspect reachable commit messages")
+    if CJK.search(result.stdout):
+        fail("Non-English CJK text found in reachable commit messages")
 
 print("Repository language and source-boundary checks passed.")

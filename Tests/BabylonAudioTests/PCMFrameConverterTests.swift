@@ -110,6 +110,63 @@ struct PCMFrameConverterTests {
         }
     }
 
+    @Test("A converter preserves resampler state across a continuous flow")
+    func continuousFlowMatchesSingleBufferConversion() throws {
+        let inputFormat = try AudioStreamFormat.monoPCM16(sampleRate: 16_000)
+        let outputFormat = try AudioStreamFormat.monoPCM16(sampleRate: 48_000)
+        let flowID = AudioFlowID()
+        let inputFrames = try makeSineFrames(
+            count: 8,
+            flowID: flowID,
+            format: inputFormat,
+            frequency: 1_173
+        )
+        let converter = try PCMFrameConverter(
+            outputFormat: outputFormat,
+            maximumInputDuration: .milliseconds(20)
+        )
+
+        let streamed = try inputFrames.map(converter.convert)
+        let combinedInput = try combine(inputFrames)
+        let reference = try PCMFrameConverter(
+            outputFormat: outputFormat,
+            maximumInputDuration: .milliseconds(200)
+        ).convert(combinedInput)
+
+        #expect(streamed.reduce(0) { $0 + $1.payload.count } == reference.payload.count)
+        #expect(maximumSampleDifference(
+            streamed.flatMap { pcm16Samples($0.payload) },
+            pcm16Samples(reference.payload)
+        ) <= 2)
+    }
+
+    @Test("A converter rejects replacement flow or input format until reset")
+    func streamContextMustBeReset() throws {
+        let outputFormat = try AudioStreamFormat.monoPCM16(sampleRate: 48_000)
+        let firstFormat = try AudioStreamFormat.monoPCM16(sampleRate: 16_000)
+        let replacementFormat = try AudioStreamFormat.monoPCM16(sampleRate: 24_000)
+        let firstFlow = AudioFlowID()
+        let replacementFlow = AudioFlowID()
+        let converter = try PCMFrameConverter(
+            outputFormat: outputFormat,
+            maximumInputDuration: .milliseconds(20)
+        )
+
+        _ = try converter.convert(makeSilentFrame(format: firstFormat, flowID: firstFlow))
+        #expect(throws: PCMFrameConversionError.streamContextChanged) {
+            try converter.convert(makeSilentFrame(format: firstFormat, flowID: replacementFlow))
+        }
+        #expect(throws: PCMFrameConversionError.streamContextChanged) {
+            try converter.convert(makeSilentFrame(format: replacementFormat, flowID: firstFlow))
+        }
+
+        converter.reset()
+        let replacement = try converter.convert(
+            makeSilentFrame(format: replacementFormat, flowID: replacementFlow)
+        )
+        #expect(replacement.flowID == replacementFlow)
+    }
+
     private func verifyConversion(
         from inputFormat: AudioStreamFormat,
         to outputFormat: AudioStreamFormat
@@ -135,17 +192,72 @@ struct PCMFrameConverterTests {
             < 1e-12)
     }
 
-    private func makeSilentFrame(format: AudioStreamFormat) throws -> AudioFrame {
+    private func makeSilentFrame(
+        format: AudioStreamFormat,
+        flowID: AudioFlowID = AudioFlowID()
+    ) throws -> AudioFrame {
         let sampleFrameCount = Int(format.sampleRate / 100)
         let payload = Data(count: sampleFrameCount * format.bytesPerFrame)
         return try AudioFrame(
-            flowID: AudioFlowID(),
+            flowID: flowID,
             sequence: 9,
             timestamp: .milliseconds(40),
             format: format,
             payload: payload,
             duration: .milliseconds(10)
         )
+    }
+
+    private func makeSineFrames(
+        count: Int,
+        flowID: AudioFlowID,
+        format: AudioStreamFormat,
+        frequency: Double
+    ) throws -> [AudioFrame] {
+        let samplesPerFrame = Int(format.sampleRate / 100)
+        return try (0..<count).map { frameIndex in
+            var payload = Data()
+            payload.reserveCapacity(samplesPerFrame * MemoryLayout<Int16>.size)
+            for sampleIndex in 0..<samplesPerFrame {
+                let absoluteIndex = frameIndex * samplesPerFrame + sampleIndex
+                let phase = 2 * Double.pi * frequency * Double(absoluteIndex) / format.sampleRate
+                var sample = Int16((sin(phase) * 20_000).rounded()).littleEndian
+                withUnsafeBytes(of: &sample) { payload.append(contentsOf: $0) }
+            }
+            return try AudioFrame(
+                flowID: flowID,
+                sequence: UInt64(frameIndex),
+                timestamp: .milliseconds(frameIndex * 10),
+                format: format,
+                payload: payload,
+                duration: .milliseconds(10)
+            )
+        }
+    }
+
+    private func combine(_ frames: [AudioFrame]) throws -> AudioFrame {
+        let payload = frames.reduce(into: Data()) { $0.append($1.payload) }
+        return try AudioFrame(
+            flowID: frames[0].flowID,
+            sequence: frames[0].sequence,
+            timestamp: frames[0].timestamp,
+            format: frames[0].format,
+            payload: payload,
+            duration: frames.reduce(.zero) { $0 + $1.duration }
+        )
+    }
+
+    private func pcm16Samples(_ data: Data) -> [Int16] {
+        data.withUnsafeBytes { bytes in
+            Array(bytes.bindMemory(to: Int16.self)).map { Int16(littleEndian: $0) }
+        }
+    }
+
+    private func maximumSampleDifference(_ left: [Int16], _ right: [Int16]) -> Int {
+        guard left.count == right.count else { return .max }
+        return zip(left, right).reduce(0) { maximum, pair in
+            max(maximum, abs(Int(pair.0) - Int(pair.1)))
+        }
     }
 
     private func formatShapes(sampleRate: Double) throws -> [AudioStreamFormat] {

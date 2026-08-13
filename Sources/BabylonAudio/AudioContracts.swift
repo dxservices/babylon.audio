@@ -95,7 +95,12 @@ public struct AudioStreamFormat: Equatable, Sendable {
 public struct AudioFrame: Equatable, Sendable {
     public let flowID: AudioFlowID
     public let sequence: UInt64
-    /// Monotonic time relative to the start of this frame's flow.
+    /// Media or capture position relative to the start of this frame's flow.
+    ///
+    /// This is not queue-entry or wall-clock time. Values are nondecreasing and
+    /// may repeat when a capture clock does not advance between adjacent frames.
+    /// Queue age and jitter-buffer freshness must use separately recorded local
+    /// monotonic enqueue/receive instants.
     public let timestamp: Duration
     public let format: AudioStreamFormat
     /// Immutable frame bytes. Planar channel payloads store complete planes in channel order.
@@ -143,6 +148,4 @@ public enum AudioContractError: Error, Equatable, Sendable {
     case sourceRequired
     case unusedSource
     case incompleteDownlink
-    case invalidMicrophoneInputPolicy
-    case invalidDeviceOutputPolicy
 }

@@ -3,9 +3,18 @@ import Foundation
 
 @available(iOS 18, macOS 13, *)
 /// Converts bounded frames synchronously outside hardware render callbacks.
-public struct PCMFrameConverter: Sendable {
+///
+/// One instance owns the resampling history for one flow and input/output format
+/// tuple. Conversion uses no priming tail, so `reset()` is the explicit stop,
+/// replacement, and format-change operation: it discards filter history and no
+/// output remains to flush. Calls are serialized internally, but callers should
+/// still keep conversion off hardware render callbacks.
+public final class PCMFrameConverter: @unchecked Sendable {
     public let outputFormat: AudioStreamFormat
     public let maximumInputDuration: Duration
+
+    private let lock = NSLock()
+    private var streamContext: StreamContext?
 
     public init(
         outputFormat: AudioStreamFormat,
@@ -19,6 +28,9 @@ public struct PCMFrameConverter: Sendable {
     }
 
     public func convert(_ frame: AudioFrame) throws -> AudioFrame {
+        lock.lock()
+        defer { lock.unlock() }
+
         guard frame.duration <= maximumInputDuration else {
             throw PCMFrameConversionError.inputDurationLimitExceeded(
                 maximum: maximumInputDuration
@@ -27,20 +39,41 @@ public struct PCMFrameConverter: Sendable {
         guard frame.format != outputFormat else {
             return frame
         }
-        guard let inputAVFormat = Self.makeAVFormat(frame.format),
-              let outputAVFormat = Self.makeAVFormat(outputFormat),
-              let converter = AVAudioConverter(
-                  from: inputAVFormat,
-                  to: outputAVFormat
-              )
-        else {
-            throw PCMFrameConversionError.unsupportedConversion
+
+        let context: StreamContext
+        if let existingContext = streamContext {
+            guard existingContext.flowID == frame.flowID,
+                  existingContext.inputFormat == frame.format
+            else {
+                throw PCMFrameConversionError.streamContextChanged
+            }
+            context = existingContext
+        } else {
+            guard let inputAVFormat = Self.makeAVFormat(frame.format),
+                  let outputAVFormat = Self.makeAVFormat(outputFormat),
+                  let converter = AVAudioConverter(
+                      from: inputAVFormat,
+                      to: outputAVFormat
+                  )
+            else {
+                throw PCMFrameConversionError.unsupportedConversion
+            }
+            converter.primeMethod = .none
+            let newContext = StreamContext(
+                flowID: frame.flowID,
+                inputFormat: frame.format,
+                inputAVFormat: inputAVFormat,
+                outputAVFormat: outputAVFormat,
+                converter: converter
+            )
+            streamContext = newContext
+            context = newContext
         }
 
         let inputFrameCount = frame.payload.count / frame.format.bytesPerFrame
         guard inputFrameCount <= Int(AVAudioFrameCount.max),
               let inputBuffer = AVAudioPCMBuffer(
-                  pcmFormat: inputAVFormat,
+                  pcmFormat: context.inputAVFormat,
                   frameCapacity: AVAudioFrameCount(inputFrameCount)
               )
         else {
@@ -54,17 +87,16 @@ public struct PCMFrameConverter: Sendable {
         ) + 1
         guard outputCapacityValue <= Double(AVAudioFrameCount.max),
               let outputBuffer = AVAudioPCMBuffer(
-                  pcmFormat: outputAVFormat,
+                  pcmFormat: context.outputAVFormat,
                   frameCapacity: AVAudioFrameCount(outputCapacityValue)
               )
         else {
             throw PCMFrameConversionError.frameTooLarge
         }
 
-        converter.primeMethod = .normal
-        let inputProvider = SinglePCMBufferProvider(buffer: inputBuffer)
+        let inputProvider = StreamingPCMBufferProvider(buffer: inputBuffer)
         var conversionError: NSError?
-        let status = converter.convert(
+        let status = context.converter.convert(
             to: outputBuffer,
             error: &conversionError
         ) { _, inputStatus in
@@ -88,6 +120,18 @@ public struct PCMFrameConverter: Sendable {
             payload: payload,
             duration: duration
         )
+    }
+
+    /// Stops the current conversion stream and discards its filter history.
+    ///
+    /// The converter uses `AVAudioConverterPrimeMethod.none`, so reset has no
+    /// output tail to return. Call this after a flow stops and before a flow or
+    /// input format is replaced.
+    public func reset() {
+        lock.lock()
+        defer { lock.unlock() }
+        streamContext?.converter.reset()
+        streamContext = nil
     }
 
     private static func makeAVFormat(_ format: AudioStreamFormat) -> AVAudioFormat? {
@@ -183,6 +227,15 @@ public struct PCMFrameConverter: Sendable {
 }
 
 @available(iOS 18, macOS 13, *)
+private struct StreamContext {
+    let flowID: AudioFlowID
+    let inputFormat: AudioStreamFormat
+    let inputAVFormat: AVAudioFormat
+    let outputAVFormat: AVAudioFormat
+    let converter: AVAudioConverter
+}
+
+@available(iOS 18, macOS 13, *)
 public enum PCMFrameConversionError: Error, Equatable, Sendable {
     case invalidConfiguration
     case inputDurationLimitExceeded(maximum: Duration)
@@ -190,10 +243,12 @@ public enum PCMFrameConversionError: Error, Equatable, Sendable {
     case frameTooLarge
     case invalidBufferLayout
     case conversionFailed
+    /// The caller must reset before replacing the flow or input format.
+    case streamContextChanged
 }
 
 @available(iOS 18, macOS 13, *)
-private final class SinglePCMBufferProvider: @unchecked Sendable {
+private final class StreamingPCMBufferProvider: @unchecked Sendable {
     private let lock = NSLock()
     private let buffer: AVAudioPCMBuffer
     private var supplied = false
@@ -208,7 +263,7 @@ private final class SinglePCMBufferProvider: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard !supplied else {
-            status.pointee = .endOfStream
+            status.pointee = .noDataNow
             return nil
         }
         supplied = true

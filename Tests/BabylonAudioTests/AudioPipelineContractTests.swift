@@ -24,28 +24,31 @@ struct AudioPipelineContractTests {
         }
     }
 
-    @Test("Microphone sources reject the external-frame input policy")
-    func microphoneRejectsExternalFramePolicy() {
+    @Test("External frames are modeled as a source, not a microphone policy")
+    func externalFramesAreASource() throws {
         let sender = RecordingSender()
+        let configuration = try AudioPipelineConfiguration(
+            source: .externalFrames,
+            uplinkSender: sender
+        )
 
-        #expect(throws: AudioContractError.self) {
-            try AudioPipelineConfiguration(
-                source: .microphone(policy: .externalFrames),
-                uplinkSender: sender
-            )
+        if case .externalFrames = configuration.source {
+            // Expected: the source itself expresses caller-provided frames.
+        } else {
+            Issue.record("Expected an external-frame source")
         }
     }
 
-    @Test("Device sinks require private output")
-    func deviceSinksRequirePrivateOutput() {
-        let sink = AudioSinkConfiguration.device(policy: .noDeviceOutput)
+    @Test("No device output is modeled by omitting a sink")
+    func noDeviceOutputIsAnAbsentSink() throws {
+        let sender = RecordingSender()
+        let configuration = try AudioPipelineConfiguration(
+            source: .externalFrames,
+            uplinkSender: sender
+        )
 
-        #expect(throws: AudioContractError.self) {
-            try AudioPipelineConfiguration(
-                source: .externalFrames,
-                localMonitorSink: sink
-            )
-        }
+        #expect(configuration.localMonitorSink == nil)
+        #expect(configuration.downlinkSink == nil)
     }
 
     @Test("Downlink requires both a receiver and a sink")

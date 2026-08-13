@@ -128,7 +128,7 @@ public struct AudioFrameProcessorChain: Sendable {
                         collector.append(output)
                     }
                 } catch {
-                    throw AudioProcessingError.processorFailed(index: index)
+                    throw AudioProcessorFailure(index: index, underlyingError: error)
                 }
                 let elapsed = max(Duration.zero, clock.now() - start)
 
@@ -202,11 +202,25 @@ public enum AudioProcessingError: Error, Equatable, Sendable {
     case invalidBudget
     case invalidDeclaration(index: Int)
     case processorExceedsBudget(index: Int)
-    case processorFailed(index: Int)
     case processingTimedOut(index: Int, elapsed: Duration, budget: Duration)
     case outputLimitExceeded(index: Int, maximum: Int)
     case unexpectedOutputFlow(index: Int)
     case unexpectedOutputFormat(index: Int)
+}
+
+/// A processor failure that retains the exact caller-owned error value.
+///
+/// BabylonAudio never logs or stringifies the underlying error. Consumers may
+/// inspect or map it at their own content and privacy boundary.
+@available(iOS 18, macOS 13, *)
+public struct AudioProcessorFailure: Error, @unchecked Sendable {
+    public let index: Int
+    public let underlyingError: any Error
+
+    public init(index: Int, underlyingError: any Error) {
+        self.index = index
+        self.underlyingError = underlyingError
+    }
 }
 
 @available(iOS 18, macOS 13, *)

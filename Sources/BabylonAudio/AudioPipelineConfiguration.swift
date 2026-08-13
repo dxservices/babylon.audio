@@ -1,12 +1,10 @@
 public enum AudioInputPolicy: Equatable, Sendable {
     case builtInMicrophoneRequired
     case preferBuiltInAllowPrivateAccessoryDuplex
-    case externalFrames
 }
 
 public enum DeviceOutputPolicy: Equatable, Sendable {
     case privateOutputRequired
-    case noDeviceOutput
 }
 
 @available(iOS 18, macOS 13, *)
@@ -55,25 +53,11 @@ public struct AudioPipelineConfiguration: Sendable {
         guard !hasAnyDownlinkComponent || hasCompleteDownlink else {
             throw AudioContractError.incompleteDownlink
         }
-        if case .some(.microphone(policy: .externalFrames)) = source {
-            throw AudioContractError.invalidMicrophoneInputPolicy
-        }
-        if [localMonitorSink, downlinkSink].contains(where: Self.disablesDeviceOutput) {
-            throw AudioContractError.invalidDeviceOutputPolicy
-        }
-
         self.source = source
         self.localMonitorSink = localMonitorSink
         self.uplinkSender = uplinkSender
         self.downlinkReceiver = downlinkReceiver
         self.downlinkSink = downlinkSink
         self.diagnosticSink = diagnosticSink
-    }
-
-    private static func disablesDeviceOutput(_ sink: AudioSinkConfiguration?) -> Bool {
-        if case .some(.device(policy: .noDeviceOutput)) = sink {
-            return true
-        }
-        return false
     }
 }

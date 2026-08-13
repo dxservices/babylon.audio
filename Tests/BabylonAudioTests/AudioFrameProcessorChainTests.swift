@@ -56,8 +56,14 @@ struct AudioFrameProcessorChainTests {
             clock: AudioMonotonicClock(now: { timeSource.next() })
         )
 
-        #expect(throws: AudioProcessingError.processorFailed(index: 0)) {
-            try failing.process(frame)
+        do {
+            _ = try failing.process(frame)
+            Issue.record("Expected the processor to fail")
+        } catch let failure as AudioProcessorFailure {
+            #expect(failure.index == 0)
+            #expect(failure.underlyingError is ProcessorTestError)
+        } catch {
+            Issue.record("Expected AudioProcessorFailure, got \(type(of: error))")
         }
         #expect(throws: AudioProcessingError.processingTimedOut(
             index: 0,
