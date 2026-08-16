@@ -86,6 +86,22 @@ deactivation failure is reported as a content-free boolean result and cannot
 skip consumer delivery. For a media-services reset, the coordinator additionally
 replaces the invalid device-engine graph after deactivation and before consumer
 delivery; it never asks the caller to recover against stale audio objects.
+Device events are FIFO-serialized through the end of consumer delivery. Caller
+session/graph configuration must run through `performConfiguration`, which is
+mutually exclusive with the hardware, buffer, deactivate, and rebuild phase.
+Every boundary event synchronously latches idempotent output mute before waiting
+for either gate, so queued delivery or configuration cannot delay fail-closed
+silence. The full mute-and-stop sequence still runs inside the transition gate.
+Delivery does not hold the configuration gate, so an event sink may await
+configuration directly while the next device event remains queued. Configuration
+calls must not be nested. Serialization does not preempt an operation already in
+progress; output must remain muted until its route safety is confirmed. A custom
+`discardPendingAudio` must not call `performConfiguration`, and an event sink must
+not await `handle`, because each callback already runs under the corresponding
+gate. Cancellation-aware configuration still occupies its FIFO position before
+exiting without running caller work. Event snapshots describe observation-time
+state; configuration must inspect the current session route again rather than
+treating a queued `routeChanged` snapshot as current.
 
 The consumer must retain the coordinator until both the device engine and
 audio session are no longer in use. Its convenience initializer installs the

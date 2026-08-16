@@ -29,6 +29,7 @@ struct AudioSafetyCoordinatorTests {
             ))
             #expect(recorder.actions == [
                 .muteOutput,
+                .muteOutput,
                 .stopCapture,
                 .stopPlayback,
                 .discardPendingAudio,
@@ -59,6 +60,7 @@ struct AudioSafetyCoordinatorTests {
             sessionDeactivated: false
         ))
         #expect(recorder.actions == [
+            .muteOutput,
             .muteOutput,
             .stopCapture,
             .stopPlayback,
@@ -110,6 +112,104 @@ struct AudioSafetyCoordinatorTests {
             sessionDeactivated: false
         ))
         #expect(recorder.actions == [.deliverEvent(event)])
+    }
+
+    @Test("Device events and caller configuration use serialized transitions")
+    func eventsAndConfigurationAreSerialized() async throws {
+        let recorder = SafetyActionRecorder()
+        let buffers = SuspendedFirstBuffers(recorder: recorder)
+        let eventSink = SuspendedFirstDeviceEventSink(recorder: recorder)
+        let coordinator = AudioSafetyCoordinator(
+            hardware: RecordingHardware(recorder: recorder),
+            buffers: buffers,
+            session: RecordingSafetySession(recorder: recorder),
+            eventSink: eventSink
+        )
+        let firstEvent = AudioDeviceEvent.interruptionBegan
+        let secondEvent = AudioDeviceEvent.mediaServicesReset
+
+        let firstHandling = Task {
+            await coordinator.handle(firstEvent)
+        }
+        await buffers.waitUntilFirstDiscardStarts()
+
+        let configuration = Task {
+            try await coordinator.performConfiguration {
+                recorder.actions.append(.configure)
+            }
+        }
+        let secondHandling = Task {
+            await coordinator.handle(secondEvent)
+        }
+        for _ in 0..<10 { await Task.yield() }
+
+        #expect(!recorder.actions.contains(.configure))
+        #expect(recorder.actions.filter { $0 == .muteOutput }.count == 3)
+
+        buffers.resumeFirstDiscard()
+        await eventSink.waitUntilFirstDeliveryStarts()
+        try await configuration.value
+
+        #expect(recorder.actions == [
+            .muteOutput,
+            .muteOutput,
+            .stopCapture,
+            .stopPlayback,
+            .discardPendingAudio,
+            .muteOutput,
+            .deactivateSession,
+            .deliverEvent(firstEvent),
+            .configure,
+        ])
+
+        eventSink.resumeFirstDelivery()
+        _ = await firstHandling.value
+        _ = await secondHandling.value
+
+        #expect(recorder.actions.suffix(7) == [
+            .muteOutput,
+            .stopCapture,
+            .stopPlayback,
+            .discardPendingAudio,
+            .deactivateSession,
+            .rebuildMediaServicesGraph,
+            .deliverEvent(secondEvent),
+        ])
+    }
+
+    @Test("Event sink can await configuration while the next event stays queued")
+    func eventSinkCanAwaitConfiguration() async {
+        let recorder = SafetyActionRecorder()
+        let eventSink = ConfiguringFirstDeviceEventSink(recorder: recorder)
+        let coordinator = AudioSafetyCoordinator(
+            hardware: RecordingHardware(recorder: recorder),
+            buffers: RecordingBuffers(recorder: recorder),
+            session: RecordingSafetySession(recorder: recorder),
+            eventSink: eventSink
+        )
+        eventSink.coordinator = coordinator
+
+        let firstHandling = Task {
+            await coordinator.handle(.interruptionBegan)
+        }
+        await eventSink.waitUntilConfigurationStarts()
+
+        let secondHandling = Task {
+            await coordinator.handle(.mediaServicesReset)
+        }
+        for _ in 0..<10 { await Task.yield() }
+
+        #expect(recorder.actions.last == .muteOutput)
+        #expect(recorder.actions.filter { $0 == .stopCapture }.count == 1)
+        #expect(!recorder.actions.contains(.rebuildMediaServicesGraph))
+
+        eventSink.resumeConfiguration()
+        _ = await firstHandling.value
+        _ = await secondHandling.value
+
+        #expect(!eventSink.configurationFailed)
+        #expect(recorder.actions.filter { $0 == .stopCapture }.count == 2)
+        #expect(recorder.actions.contains(.rebuildMediaServicesGraph))
     }
 
     @Test("The streaming buffer adapter stops both flow generations")
@@ -176,6 +276,7 @@ private final class SafetyActionRecorder {
         case discardPendingAudio
         case deactivateSession
         case rebuildMediaServicesGraph
+        case configure
         case deliverEvent(AudioDeviceEvent)
     }
 
@@ -221,6 +322,48 @@ private final class RecordingBuffers: AudioPendingAudioDiscarding {
 }
 
 @MainActor
+private final class SuspendedFirstBuffers: AudioPendingAudioDiscarding {
+    private let recorder: SafetyActionRecorder
+    private var discardCount = 0
+    private var firstDiscardStarted = false
+    private var firstDiscardStartedWaiters:
+        [CheckedContinuation<Void, Never>] = []
+    private var firstDiscardContinuation: CheckedContinuation<Void, Never>?
+
+    init(recorder: SafetyActionRecorder) {
+        self.recorder = recorder
+    }
+
+    func discardPendingAudio() async {
+        recorder.actions.append(.discardPendingAudio)
+        discardCount += 1
+        guard discardCount == 1 else { return }
+
+        firstDiscardStarted = true
+        let waiters = firstDiscardStartedWaiters
+        firstDiscardStartedWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+        await withCheckedContinuation { continuation in
+            firstDiscardContinuation = continuation
+        }
+    }
+
+    func waitUntilFirstDiscardStarts() async {
+        guard !firstDiscardStarted else { return }
+        await withCheckedContinuation { continuation in
+            firstDiscardStartedWaiters.append(continuation)
+        }
+    }
+
+    func resumeFirstDiscard() {
+        firstDiscardContinuation?.resume()
+        firstDiscardContinuation = nil
+    }
+}
+
+@MainActor
 private final class RecordingDeviceEventSink: AudioDeviceEventSink {
     private let recorder: SafetyActionRecorder
 
@@ -230,6 +373,100 @@ private final class RecordingDeviceEventSink: AudioDeviceEventSink {
 
     func receive(_ event: AudioDeviceEvent) async {
         recorder.actions.append(.deliverEvent(event))
+    }
+}
+
+@MainActor
+private final class SuspendedFirstDeviceEventSink: AudioDeviceEventSink {
+    private let recorder: SafetyActionRecorder
+    private var deliveryCount = 0
+    private var firstDeliveryStarted = false
+    private var firstDeliveryStartedWaiters:
+        [CheckedContinuation<Void, Never>] = []
+    private var firstDeliveryContinuation: CheckedContinuation<Void, Never>?
+
+    init(recorder: SafetyActionRecorder) {
+        self.recorder = recorder
+    }
+
+    func receive(_ event: AudioDeviceEvent) async {
+        recorder.actions.append(.deliverEvent(event))
+        deliveryCount += 1
+        guard deliveryCount == 1 else { return }
+
+        firstDeliveryStarted = true
+        let waiters = firstDeliveryStartedWaiters
+        firstDeliveryStartedWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+        await withCheckedContinuation { continuation in
+            firstDeliveryContinuation = continuation
+        }
+    }
+
+    func waitUntilFirstDeliveryStarts() async {
+        guard !firstDeliveryStarted else { return }
+        await withCheckedContinuation { continuation in
+            firstDeliveryStartedWaiters.append(continuation)
+        }
+    }
+
+    func resumeFirstDelivery() {
+        firstDeliveryContinuation?.resume()
+        firstDeliveryContinuation = nil
+    }
+}
+
+@MainActor
+private final class ConfiguringFirstDeviceEventSink: AudioDeviceEventSink {
+    weak var coordinator: AudioSafetyCoordinator?
+    private(set) var configurationFailed = false
+
+    private let recorder: SafetyActionRecorder
+    private var deliveryCount = 0
+    private var configurationStarted = false
+    private var configurationStartedWaiters:
+        [CheckedContinuation<Void, Never>] = []
+    private var configurationContinuation: CheckedContinuation<Void, Never>?
+
+    init(recorder: SafetyActionRecorder) {
+        self.recorder = recorder
+    }
+
+    func receive(_ event: AudioDeviceEvent) async {
+        recorder.actions.append(.deliverEvent(event))
+        deliveryCount += 1
+        guard deliveryCount == 1, let coordinator else { return }
+
+        do {
+            try await coordinator.performConfiguration {
+                self.recorder.actions.append(.configure)
+                self.configurationStarted = true
+                let waiters = self.configurationStartedWaiters
+                self.configurationStartedWaiters.removeAll()
+                for waiter in waiters {
+                    waiter.resume()
+                }
+                await withCheckedContinuation { continuation in
+                    self.configurationContinuation = continuation
+                }
+            }
+        } catch {
+            configurationFailed = true
+        }
+    }
+
+    func waitUntilConfigurationStarts() async {
+        guard !configurationStarted else { return }
+        await withCheckedContinuation { continuation in
+            configurationStartedWaiters.append(continuation)
+        }
+    }
+
+    func resumeConfiguration() {
+        configurationContinuation?.resume()
+        configurationContinuation = nil
     }
 }
 

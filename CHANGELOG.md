@@ -49,5 +49,8 @@ All notable changes to this project will be documented in this file.
   playback stop.
 - Rebuild invalid engine and player-node objects after a media-services reset,
   leaving a fresh stopped, muted, and unconfigured graph before caller delivery.
+- Eagerly latch mute for boundary events, serialize device events through
+  consumer delivery, and serialize caller configuration against fail-closed
+  hardware/session transitions.
 - Extend repository checks to cover all reachable commit messages and
   extensionless text files.
