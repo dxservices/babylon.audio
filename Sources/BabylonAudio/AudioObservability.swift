@@ -24,7 +24,9 @@ public enum AudioDiscardReason: Equatable, Sendable {
     case overflow
     case expired
     case staleFlow
+    case outOfOrder
     case stopped
+    case endpointFailure
     case processingFailure
 }
 

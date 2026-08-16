@@ -16,5 +16,13 @@ All notable changes to this project will be documented in this file.
   so invalid configurations are no longer expressible.
 - Define frame timestamps as flow-relative media or capture positions; queue
   freshness uses separate local monotonic enqueue or receive instants.
+- Add a format-aware bounded uplink queue with one active send, drop-oldest
+  overflow handling, local monotonic expiry, endpoint-failure reporting, and
+  flow-generation isolation.
+- Add a bounded downlink jitter buffer with receiver integration, sequence
+  ordering, target prebuffering, rebuffering, pending-plus-in-flight accounting,
+  and data-consumed sink scheduling semantics.
+- Add content-free streaming snapshots and diagnostics for queue duration,
+  discard counts, latency, overflow, expiry, stale work, and rebuffering.
 - Extend repository checks to cover all reachable commit messages and
   extensionless text files.

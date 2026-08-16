@@ -35,6 +35,28 @@ so there is no output to flush.
 - Private-output fail-closed policy
 - Content-free diagnostics
 
+## Streaming data plane
+
+`BoundedUplinkQueue` serializes one `AudioFrameSender.send` at a time. Its
+pending budget is calculated from each validated frame's duration, independent
+of sample rate, channel count, encoding, and byte layout. Overflow keeps the
+newest pending audio, and frame age is measured from a queue-local monotonic
+enqueue instant rather than from the frame's media timestamp.
+
+`BoundedDownlinkJitterBuffer` can consume an `AudioFrameReceiver` directly or
+accept frames through `enqueue`. It reorders pending frames by sequence during
+prebuffering, bounds pending plus in-flight audio, and requires the target
+duration again after starvation. Duplicate or already-delivered sequences are
+discarded. A sink's `consume` operation must complete at the data-consumed
+scheduling boundary, not after audible playback completes.
+
+The initial policies use a one-second maximum buffer, a 1.5-second maximum
+frame age, and a 200-millisecond downlink target. These are configurable
+starting points, not provider guarantees. Stop, replacement, and endpoint
+failure invalidate the active flow generation so late completions cannot
+restart old work. Snapshots and optional diagnostics contain counts, durations,
+latencies, and discard reasons only.
+
 ## Non-goals
 
 BabylonAudio does not promise to:

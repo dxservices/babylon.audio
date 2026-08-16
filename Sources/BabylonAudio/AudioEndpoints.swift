@@ -7,6 +7,10 @@ public protocol AudioFrameSource: Sendable {
 
 @available(iOS 18, macOS 13, *)
 public protocol AudioFrameSink: Sendable {
+    /// Returns when the sink has consumed the frame data and can accept the next frame.
+    ///
+    /// A device sink uses `AVAudioPlayerNodeCompletionDataConsumed`, not
+    /// `AVAudioPlayerNodeCompletionDataPlayedBack`, to preserve gapless scheduling.
     func consume(_ frame: AudioFrame) async throws
 }
 
