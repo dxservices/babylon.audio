@@ -57,6 +57,26 @@ failure invalidate the active flow generation so late completions cannot
 restart old work. Snapshots and optional diagnostics contain counts, durations,
 latencies, and discard reasons only.
 
+## Device and route policy
+
+`AudioRouteSafetyPolicy` evaluates the actual current input and output route.
+Wired headphones are accepted directly. Bluetooth A2DP, HFP, and LE outputs
+require an exact caller-owned `AudioTrustedOutput`; BabylonAudio never persists
+that trust. Missing, public, mixed, or multiple outputs fail closed.
+
+HFP is not an implicit fallback. `builtInMicrophoneRequired` activates only the
+built-in-microphone/private-output profile and rejects an HFP route.
+`preferBuiltInAllowPrivateAccessoryDuplex` explicitly permits an ordered A2DP
+then private-accessory-duplex attempt. `AudioRouteController` returns
+`trustRequired` without treating an unconfirmed Bluetooth route as safe. It
+deactivates the audio session before returning that result, so caller
+confirmation never leaves the package's play-and-record session active. After
+persisting trust in its own boundary, the caller must configure the route
+again. The controller also deactivates when no safe private route forms.
+The iOS `AudioSessionController.shared` is the package-owned low-level
+`AVAudioSession` adapter; preference success never substitutes for inspecting
+its resulting `routeSnapshot`.
+
 ## Non-goals
 
 BabylonAudio does not promise to:
