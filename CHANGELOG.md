@@ -44,5 +44,8 @@ All notable changes to this project will be documented in this file.
 - Accept hardware callback sizes up to the configured buffered-duration bound
   and turn oversized buffers, layout failures, and handoff overflow into
   content-free terminal capture failures instead of silent loss.
+- Add exact-format shared-engine PCM playback through `AudioFrameSink`, with
+  data-consumed completion handoff and deterministic pending-consume failure on
+  playback stop.
 - Extend repository checks to cover all reachable commit messages and
   extensionless text files.

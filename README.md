@@ -109,14 +109,30 @@ silently producing zero audio. A dedicated drain task then assembles
 fixed-duration frames, performs stateful conversion to the requested format,
 and serially invokes the caller handler. Hardware-format assembler and
 converter validation completes synchronously before the tap is installed.
+Configuration also rejects a `maximumFramesPerCallback` that cannot cover every
+frame permitted by `maximumBufferedDuration`, so accepted callback sizes cannot
+later fail solely because the assembler work bound is smaller.
 
 `stopCapture()` removes the tap, closes the handoff, and requests drain-task
 cancellation, but it is not an async delivery barrier: an `onFrame` call already
 in flight may return after `stopCapture()`. Consumers must invalidate the flow
 generation and stop downstream bounded queues as part of the same safety
 transition; late delivery is then rejected by generation. PCM playback
-scheduling remains under active A4 development; Simulator compilation does not
-validate microphone or route hardware behavior.
+scheduling uses the same shared engine. Callers configure one exact PCM format
+before starting the engine; the engine then acts as an `AudioFrameSink` and
+rejects missing or mismatched playback configuration. Each consume operation
+returns only from `AVAudioPlayerNodeCompletionDataConsumed`, allowing the next
+buffer to be scheduled without waiting for audible completion. The completion
+callback only yields to a one-element bridge and performs no async, logging,
+network, disk, or business work. If playback has never been unmuted, the player
+node remains stopped and `consume` intentionally backpressures until a safe-route
+unmute, `stopPlayback`, or task cancellation. Muting an already-started player
+sets its volume to zero without stopping it, so scheduled data continues to be
+consumed silently; the safety coordinator follows mute with `stopPlayback` when
+discard is required. `stopPlayback()` terminates all pending bridges before
+stopping the player node, so discarded buffers fail with `playbackStopped`
+instead of reporting successful consumption. Simulator compilation does not
+validate microphone, playback, or route hardware behavior.
 
 ## Non-goals
 

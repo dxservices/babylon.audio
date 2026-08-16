@@ -5,6 +5,94 @@ import Testing
 @Suite("Audio device engine")
 @MainActor
 struct AudioDeviceEngineTests {
+    @Test("Playback format must be configured before the engine starts")
+    func playbackConfigurationPrecedesEngineStart() async throws {
+        let format = try AudioStreamFormat.monoPCM16(sampleRate: 24_000)
+        let backend = RecordingDeviceEngineBackend()
+        let engine = AudioDeviceEngine(backend: backend)
+        try engine.start()
+
+        #expect(throws: AudioDeviceEngineError.engineAlreadyRunning) {
+            try engine.configurePlayback(format: format)
+        }
+        await #expect(throws: AudioDeviceEngineError.playbackNotConfigured) {
+            try await engine.consume(makePlaybackFrame(format: format))
+        }
+    }
+
+    @Test("Playback consume returns only after data-consumed completion")
+    func playbackCompletesWhenDataIsConsumed() async throws {
+        let format = try AudioStreamFormat.monoPCM16(sampleRate: 24_000)
+        let backend = RecordingDeviceEngineBackend()
+        let engine = AudioDeviceEngine(backend: backend)
+        try engine.configurePlayback(format: format)
+        try engine.start()
+        let frame = try makePlaybackFrame(format: format)
+
+        let consumption = Task {
+            try await engine.consume(frame)
+        }
+        for _ in 0..<10 { await Task.yield() }
+
+        #expect(backend.pendingPlaybackSequences == [frame.sequence])
+        backend.completePlayback(sequence: frame.sequence)
+        try await consumption.value
+        #expect(backend.actions == [
+            .configurePlayback(format),
+            .start,
+            .schedulePlayback(frame.sequence),
+        ])
+    }
+
+    @Test("Muted startup keeps playback consumption pending until unmuted")
+    func mutedStartupBackpressuresPlayback() async throws {
+        let format = try AudioStreamFormat.monoPCM16(sampleRate: 24_000)
+        let backend = RecordingDeviceEngineBackend()
+        let engine = AudioDeviceEngine(backend: backend)
+        try engine.configurePlayback(format: format)
+        try engine.start()
+        let frame = try makePlaybackFrame(format: format)
+        let consumption = Task {
+            try await engine.consume(frame)
+        }
+        for _ in 0..<10 { await Task.yield() }
+
+        #expect(engine.isOutputMuted)
+        #expect(backend.pendingPlaybackSequences == [frame.sequence])
+
+        let output = AudioRoutePort(
+            id: "wired",
+            name: "Wired Headphones",
+            kind: .wiredHeadphones
+        )
+        try engine.unmuteOutput(after: .safe(output: output))
+        backend.completePlayback(sequence: frame.sequence)
+        try await consumption.value
+    }
+
+    @Test("Stopping playback fails all pending consumption")
+    func stopPlaybackFailsPendingConsumption() async throws {
+        let format = try AudioStreamFormat.monoPCM16(sampleRate: 24_000)
+        let backend = RecordingDeviceEngineBackend()
+        let engine = AudioDeviceEngine(backend: backend)
+        try engine.configurePlayback(format: format)
+        try engine.start()
+        let frame = try makePlaybackFrame(format: format)
+        let consumption = Task {
+            try await engine.consume(frame)
+        }
+        for _ in 0..<10 { await Task.yield() }
+
+        engine.stopPlayback()
+
+        do {
+            try await consumption.value
+            Issue.record("Expected pending playback to fail")
+        } catch {
+            #expect(error as? AudioDeviceEngineError == .playbackStopped)
+        }
+    }
+
     @Test("Capture callback overflow becomes a visible bounded failure")
     func captureCallbackOverflowIsVisible() async {
         let bridge = BoundedAudioCaptureBridge(capacity: 2)
@@ -32,6 +120,22 @@ struct AudioDeviceEngineTests {
         #expect(configuration.maximumCallbackFrameCapacity(
             sampleRate: 48_000
         ) == 4_800)
+    }
+
+    @Test("Capture callback work bound must cover the buffered-duration bound")
+    func captureCallbackWorkBoundMustBeConsistent() throws {
+        let format = try AudioStreamFormat.monoPCM16(sampleRate: 24_000)
+
+        #expect(throws: AudioDeviceEngineError.invalidCaptureConfiguration) {
+            try AudioCaptureConfiguration(
+                flowID: AudioFlowID(),
+                format: format,
+                frameDuration: .milliseconds(20),
+                maximumBufferedDuration: .milliseconds(100),
+                maximumFramesPerCallback: 4,
+                maximumPendingCallbackCount: 4
+            )
+        }
     }
 
     @Test("Capture requires a running engine and has one active tap")
@@ -137,6 +241,19 @@ struct AudioDeviceEngineTests {
             maximumPendingCallbackCount: 4
         )
     }
+
+    private func makePlaybackFrame(
+        format: AudioStreamFormat
+    ) throws -> AudioFrame {
+        try AudioFrame(
+            flowID: AudioFlowID(),
+            sequence: 7,
+            timestamp: .zero,
+            format: format,
+            payload: Data(count: 960),
+            duration: .milliseconds(20)
+        )
+    }
 }
 
 @MainActor
@@ -144,6 +261,8 @@ private final class RecordingDeviceEngineBackend: AudioDeviceEngineBackend {
     enum Action: Equatable {
         case start
         case stop
+        case configurePlayback(AudioStreamFormat)
+        case schedulePlayback(UInt64)
         case setOutputMuted(Bool)
         case startCapture(AudioCaptureConfiguration)
         case stopCapture
@@ -152,6 +271,12 @@ private final class RecordingDeviceEngineBackend: AudioDeviceEngineBackend {
 
     private(set) var actions: [Action] = []
     private var captureFailureHandler: AudioCaptureFailureHandler?
+    private var playbackContinuations:
+        [UInt64: CheckedContinuation<Void, any Error>] = [:]
+
+    var pendingPlaybackSequences: [UInt64] {
+        playbackContinuations.keys.sorted()
+    }
 
     func start() throws {
         actions.append(.start)
@@ -163,6 +288,21 @@ private final class RecordingDeviceEngineBackend: AudioDeviceEngineBackend {
 
     func setOutputMuted(_ muted: Bool) {
         actions.append(.setOutputMuted(muted))
+    }
+
+    func configurePlayback(format: AudioStreamFormat) throws {
+        actions.append(.configurePlayback(format))
+    }
+
+    func schedulePlayback(_ frame: AudioFrame) async throws {
+        actions.append(.schedulePlayback(frame.sequence))
+        try await withCheckedThrowingContinuation { continuation in
+            playbackContinuations[frame.sequence] = continuation
+        }
+    }
+
+    func completePlayback(sequence: UInt64) {
+        playbackContinuations.removeValue(forKey: sequence)?.resume()
     }
 
     func startCapture(
@@ -184,6 +324,11 @@ private final class RecordingDeviceEngineBackend: AudioDeviceEngineBackend {
 
     func stopPlayback() {
         actions.append(.stopPlayback)
+        let pending = Array(playbackContinuations.values)
+        playbackContinuations.removeAll()
+        for continuation in pending {
+            continuation.resume(throwing: AudioDeviceEngineError.playbackStopped)
+        }
     }
 }
 

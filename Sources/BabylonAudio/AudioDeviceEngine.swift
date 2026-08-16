@@ -7,6 +7,11 @@ public enum AudioDeviceEngineError: Error, Equatable, Sendable {
     case captureHardwareBufferLimitExceeded
     case captureBufferLayoutMismatch
     case captureHandoffOverflow
+    case engineAlreadyRunning
+    case playbackNotConfigured
+    case playbackFormatMismatch
+    case invalidPlaybackBuffer
+    case playbackStopped
 }
 
 @available(iOS 18, macOS 13, *)
@@ -41,10 +46,19 @@ public struct AudioCaptureConfiguration: Equatable, Sendable {
             throw AudioDeviceEngineError.invalidCaptureConfiguration
         }
 
-        guard Self.frameCapacity(
+        guard let frameCapacity = Self.frameCapacity(
             duration: frameDuration,
             sampleRate: format.sampleRate
-        ) != nil else {
+        ), let maximumCallbackFrameCapacity = Self.frameCapacity(
+            duration: maximumBufferedDuration,
+            sampleRate: format.sampleRate
+        ) else {
+            throw AudioDeviceEngineError.invalidCaptureConfiguration
+        }
+        let requiredFramesPerCallback =
+            (UInt64(maximumCallbackFrameCapacity) + UInt64(frameCapacity) - 1)
+            / UInt64(frameCapacity)
+        guard UInt64(maximumFramesPerCallback) >= requiredFramesPerCallback else {
             throw AudioDeviceEngineError.invalidCaptureConfiguration
         }
 
@@ -99,6 +113,8 @@ public typealias AudioCaptureFailureHandler =
 protocol AudioDeviceEngineBackend: AnyObject {
     func start() throws
     func stop()
+    func configurePlayback(format: AudioStreamFormat) throws
+    func schedulePlayback(_ frame: AudioFrame) async throws
     func setOutputMuted(_ muted: Bool)
     func startCapture(
         configuration: AudioCaptureConfiguration,
@@ -111,10 +127,14 @@ protocol AudioDeviceEngineBackend: AnyObject {
 
 @available(iOS 18, macOS 13, *)
 @MainActor
-public final class AudioDeviceEngine: AudioHardwareSafetyControlling {
+public final class AudioDeviceEngine:
+    AudioHardwareSafetyControlling,
+    AudioFrameSink
+{
     public private(set) var isRunning = false
     public private(set) var isOutputMuted = true
     public private(set) var isCapturing = false
+    public private(set) var playbackFormat: AudioStreamFormat?
 
     private let backend: any AudioDeviceEngineBackend
 
@@ -126,6 +146,27 @@ public final class AudioDeviceEngine: AudioHardwareSafetyControlling {
         guard !isRunning else { return }
         try backend.start()
         isRunning = true
+    }
+
+    public func configurePlayback(format: AudioStreamFormat) throws {
+        guard !isRunning else {
+            throw AudioDeviceEngineError.engineAlreadyRunning
+        }
+        try backend.configurePlayback(format: format)
+        playbackFormat = format
+    }
+
+    public func consume(_ frame: AudioFrame) async throws {
+        guard isRunning else {
+            throw AudioDeviceEngineError.engineNotRunning
+        }
+        guard let playbackFormat else {
+            throw AudioDeviceEngineError.playbackNotConfigured
+        }
+        guard frame.format == playbackFormat else {
+            throw AudioDeviceEngineError.playbackFormatMismatch
+        }
+        try await backend.schedulePlayback(frame)
     }
 
     public func stop() {
@@ -206,13 +247,17 @@ public extension AudioDeviceEngine {
 private final class AVAudioDeviceEngineBackend: AudioDeviceEngineBackend {
     private let engine = AVAudioEngine()
     private let playerNode = AVAudioPlayerNode()
+    private var playbackFormat: AudioStreamFormat?
+    private var playbackAVFormat: AVAudioFormat?
+    private var nextPlaybackID: UInt64 = 0
+    private var playbackCompletions:
+        [UInt64: AudioPlaybackCompletionBridge] = [:]
     private var captureTapInstalled = false
     private var captureBridge: BoundedAudioCaptureBridge?
     private var captureTask: Task<Void, Never>?
 
     init() {
         engine.attach(playerNode)
-        engine.connect(playerNode, to: engine.mainMixerNode, format: nil)
         playerNode.volume = 0
     }
 
@@ -223,16 +268,61 @@ private final class AVAudioDeviceEngineBackend: AudioDeviceEngineBackend {
 
     func stop() {
         stopCapture()
-        playerNode.stop()
+        stopPlayback()
         engine.stop()
+    }
+
+    func configurePlayback(format: AudioStreamFormat) throws {
+        guard !engine.isRunning,
+              let avFormat = Self.makeAVAudioFormat(format)
+        else {
+            throw AudioDeviceEngineError.invalidPlaybackBuffer
+        }
+        engine.disconnectNodeOutput(playerNode)
+        engine.connect(playerNode, to: engine.mainMixerNode, format: avFormat)
+        playbackFormat = format
+        playbackAVFormat = avFormat
+    }
+
+    func schedulePlayback(_ frame: AudioFrame) async throws {
+        guard frame.format == playbackFormat,
+              let playbackAVFormat,
+              let buffer = try? Self.makePlaybackBuffer(
+                frame: frame,
+                format: playbackAVFormat
+              ),
+              nextPlaybackID < UInt64.max
+        else {
+            throw AudioDeviceEngineError.invalidPlaybackBuffer
+        }
+
+        let playbackID = nextPlaybackID
+        nextPlaybackID += 1
+        let completion = AudioPlaybackCompletionBridge()
+        playbackCompletions[playbackID] = completion
+        playerNode.scheduleBuffer(
+            buffer,
+            completionCallbackType: .dataConsumed
+        ) { _ in
+            completion.consumed()
+        }
+        if playerNode.volume > 0, engine.isRunning, !playerNode.isPlaying {
+            playerNode.play()
+        }
+
+        let consumed = await completion.waitUntilConsumed()
+        playbackCompletions.removeValue(forKey: playbackID)
+        if Task.isCancelled {
+            throw CancellationError()
+        }
+        guard consumed else {
+            throw AudioDeviceEngineError.playbackStopped
+        }
     }
 
     func setOutputMuted(_ muted: Bool) {
         playerNode.volume = muted ? 0 : 1
-        if muted {
-            // Stopping also discards any buffers already scheduled to the node.
-            playerNode.stop()
-        } else if engine.isRunning, !playerNode.isPlaying {
+        if !muted, engine.isRunning, !playerNode.isPlaying {
             playerNode.play()
         }
     }
@@ -327,6 +417,11 @@ private final class AVAudioDeviceEngineBackend: AudioDeviceEngineBackend {
     }
 
     func stopPlayback() {
+        let pending = Array(playbackCompletions.values)
+        playbackCompletions.removeAll()
+        for completion in pending {
+            completion.cancel()
+        }
         playerNode.stop()
     }
 
@@ -352,6 +447,94 @@ private final class AVAudioDeviceEngineBackend: AudioDeviceEngineBackend {
             sampleEncoding: encoding,
             interleaving: format.isInterleaved ? .interleaved : .nonInterleaved
         )
+    }
+
+    private nonisolated static func makeAVAudioFormat(
+        _ format: AudioStreamFormat
+    ) -> AVAudioFormat? {
+        let commonFormat: AVAudioCommonFormat
+        switch format.sampleEncoding {
+        case .signedPCM16LittleEndian:
+            commonFormat = .pcmFormatInt16
+        case .float32:
+            commonFormat = .pcmFormatFloat32
+        }
+        return AVAudioFormat(
+            commonFormat: commonFormat,
+            sampleRate: format.sampleRate,
+            channels: AVAudioChannelCount(format.channelCount),
+            interleaved: format.interleaving == .interleaved
+        )
+    }
+
+    private nonisolated static func makePlaybackBuffer(
+        frame: AudioFrame,
+        format: AVAudioFormat
+    ) throws -> AVAudioPCMBuffer? {
+        let frameCount = frame.payload.count / frame.format.bytesPerFrame
+        guard frameCount <= Int(AVAudioFrameCount.max),
+              let buffer = AVAudioPCMBuffer(
+                pcmFormat: format,
+                frameCapacity: AVAudioFrameCount(frameCount)
+              )
+        else {
+            return nil
+        }
+        buffer.frameLength = AVAudioFrameCount(frameCount)
+        try copyPlaybackPayload(
+            frame.payload,
+            to: buffer,
+            format: frame.format
+        )
+        return buffer
+    }
+
+    private nonisolated static func copyPlaybackPayload(
+        _ payload: Data,
+        to buffer: AVAudioPCMBuffer,
+        format: AudioStreamFormat
+    ) throws {
+        let audioBuffers = UnsafeMutableAudioBufferListPointer(
+            buffer.mutableAudioBufferList
+        )
+        try payload.withUnsafeBytes { source in
+            guard let sourceBaseAddress = source.baseAddress else {
+                throw AudioDeviceEngineError.invalidPlaybackBuffer
+            }
+            switch format.interleaving {
+            case .interleaved:
+                guard audioBuffers.count == 1,
+                      let destination = audioBuffers[0].mData,
+                      payload.count <= Int(audioBuffers[0].mDataByteSize)
+                else {
+                    throw AudioDeviceEngineError.invalidPlaybackBuffer
+                }
+                destination.copyMemory(
+                    from: sourceBaseAddress,
+                    byteCount: payload.count
+                )
+            case .nonInterleaved:
+                let bytesPerPlane = payload.count / format.channelCount
+                guard audioBuffers.count == format.channelCount else {
+                    throw AudioDeviceEngineError.invalidPlaybackBuffer
+                }
+                for channel in 0..<format.channelCount {
+                    guard let destination = audioBuffers[channel].mData,
+                          bytesPerPlane <= Int(
+                            audioBuffers[channel].mDataByteSize
+                          )
+                    else {
+                        throw AudioDeviceEngineError.invalidPlaybackBuffer
+                    }
+                    destination.copyMemory(
+                        from: sourceBaseAddress.advanced(
+                            by: channel * bytesPerPlane
+                        ),
+                        byteCount: bytesPerPlane
+                    )
+                }
+            }
+        }
     }
 
     private nonisolated static func copyPayload(

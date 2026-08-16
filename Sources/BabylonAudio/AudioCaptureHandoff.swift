@@ -1,3 +1,5 @@
+import Foundation
+
 @available(iOS 18, macOS 13, *)
 enum AudioCaptureHandoffOfferResult: Equatable, Sendable {
     case accepted
@@ -88,4 +90,3 @@ final class BoundedAudioCaptureBridge: Sendable {
         handoff.finish()
     }
 }
-import Foundation
