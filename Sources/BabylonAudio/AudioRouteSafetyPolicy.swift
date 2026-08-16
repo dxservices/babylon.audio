@@ -1,4 +1,11 @@
-public enum AudioRoutePortKind: String, Codable, Equatable, Hashable, Sendable {
+public enum AudioRoutePortKind:
+    String,
+    CaseIterable,
+    Codable,
+    Equatable,
+    Hashable,
+    Sendable
+{
     case wiredHeadphones
     case headsetMicrophone
     case bluetoothA2DP
@@ -126,6 +133,7 @@ public enum AudioRouteSafetyPolicy {
     public static func evaluate(
         _ route: AudioRouteSnapshot,
         inputPolicy: AudioInputPolicy,
+        outputPolicy: DeviceOutputPolicy,
         trustedOutputs: Set<AudioTrustedOutput>
     ) -> AudioRouteSafetyEvaluation {
         guard !route.outputs.isEmpty else {
@@ -142,7 +150,7 @@ public enum AudioRouteSafetyPolicy {
         guard inputSatisfiesPolicy(route.inputs, policy: inputPolicy) else {
             return .unsafe(reason: .inputPolicyViolation)
         }
-        guard output.kind.isPotentialPrivateOutput else {
+        guard outputSatisfiesPolicy(output, policy: outputPolicy) else {
             return .unsafe(reason: .nonPrivateOutput)
         }
         if output.kind == .wiredHeadphones {
@@ -152,6 +160,16 @@ public enum AudioRouteSafetyPolicy {
             return .safe(output: output)
         }
         return .trustRequired(output: output)
+    }
+
+    private static func outputSatisfiesPolicy(
+        _ output: AudioRoutePort,
+        policy: DeviceOutputPolicy
+    ) -> Bool {
+        switch policy {
+        case .privateOutputRequired:
+            output.kind.isPotentialPrivateOutput
+        }
     }
 
     private static func inputSatisfiesPolicy(

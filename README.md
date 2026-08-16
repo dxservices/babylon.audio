@@ -62,7 +62,11 @@ latencies, and discard reasons only.
 `AudioRouteSafetyPolicy` evaluates the actual current input and output route.
 Wired headphones are accepted directly. Bluetooth A2DP, HFP, and LE outputs
 require an exact caller-owned `AudioTrustedOutput`; BabylonAudio never persists
-that trust. Missing, public, mixed, or multiple outputs fail closed.
+that trust. Missing, public, mixed, or multiple outputs fail closed. Both
+`AudioRouteSafetyPolicy.evaluate` and `AudioRouteController.configure` require
+an explicit `DeviceOutputPolicy`; v0.1 supports only
+`.privateOutputRequired`. Preference success never replaces evaluation of the
+resulting current route.
 
 HFP is not an implicit fallback. `builtInMicrophoneRequired` activates only the
 built-in-microphone/private-output profile and rejects an HFP route.
@@ -76,6 +80,13 @@ again. The controller also deactivates when no safe private route forms.
 The iOS `AudioSessionController.shared` is the package-owned low-level
 `AVAudioSession` adapter; preference success never substitutes for inspecting
 its resulting `routeSnapshot`.
+
+Microphone selection is represented only by
+`AudioSourceConfiguration.microphone(policy:)`; caller-provided PCM uses
+`.externalFrames` or `.external`. Device playback is represented only by
+`AudioSinkConfiguration.device(policy: .privateOutputRequired)`. Omitting a
+device sink means that the pipeline has no device-output path; it never implies
+a speaker fallback.
 
 `AudioSafetyCoordinator` connects route-change, interruption, and media-reset
 facts to a fixed fail-closed sequence. It latches output mute, stops capture,

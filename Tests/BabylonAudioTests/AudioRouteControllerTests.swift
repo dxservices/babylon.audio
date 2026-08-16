@@ -21,6 +21,7 @@ struct AudioRouteControllerTests {
 
         let result = try await controller.configure(
             inputPolicy: .builtInMicrophoneRequired,
+            outputPolicy: .privateOutputRequired,
             trustedOutputs: []
         )
 
@@ -54,6 +55,7 @@ struct AudioRouteControllerTests {
 
         let result = try await controller.configure(
             inputPolicy: .preferBuiltInAllowPrivateAccessoryDuplex,
+            outputPolicy: .privateOutputRequired,
             trustedOutputs: [AudioTrustedOutput(output: hfpOutput)]
         )
 
@@ -85,6 +87,7 @@ struct AudioRouteControllerTests {
 
         let result = try await controller.configure(
             inputPolicy: .builtInMicrophoneRequired,
+            outputPolicy: .privateOutputRequired,
             trustedOutputs: []
         )
 
@@ -112,6 +115,7 @@ struct AudioRouteControllerTests {
         do {
             _ = try await controller.configure(
                 inputPolicy: .builtInMicrophoneRequired,
+                outputPolicy: .privateOutputRequired,
                 trustedOutputs: []
             )
             Issue.record("Expected activation to fail")

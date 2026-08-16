@@ -39,6 +39,28 @@ struct AudioPipelineContractTests {
         }
     }
 
+    @Test("Microphone policies are explicit microphone source choices")
+    func microphonePoliciesAreSourceChoices() throws {
+        let sender = RecordingSender()
+        let policies: [AudioInputPolicy] = [
+            .builtInMicrophoneRequired,
+            .preferBuiltInAllowPrivateAccessoryDuplex,
+        ]
+
+        for policy in policies {
+            let configuration = try AudioPipelineConfiguration(
+                source: .microphone(policy: policy),
+                uplinkSender: sender
+            )
+            guard case .microphone(let configuredPolicy) = configuration.source
+            else {
+                Issue.record("Expected an explicit microphone source")
+                continue
+            }
+            #expect(configuredPolicy == policy)
+        }
+    }
+
     @Test("No device output is modeled by omitting a sink")
     func noDeviceOutputIsAnAbsentSink() throws {
         let sender = RecordingSender()
@@ -49,6 +71,20 @@ struct AudioPipelineContractTests {
 
         #expect(configuration.localMonitorSink == nil)
         #expect(configuration.downlinkSink == nil)
+    }
+
+    @Test("Device output requires the explicit private-output policy")
+    func deviceOutputRequiresPrivatePolicy() throws {
+        let configuration = try AudioPipelineConfiguration(
+            source: .externalFrames,
+            localMonitorSink: .device(policy: .privateOutputRequired)
+        )
+
+        guard case .device(let policy) = configuration.localMonitorSink else {
+            Issue.record("Expected an explicit device sink")
+            return
+        }
+        #expect(policy == .privateOutputRequired)
     }
 
     @Test("Downlink requires both a receiver and a sink")

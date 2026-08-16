@@ -14,6 +14,7 @@ struct AudioRouteSafetyPolicyTests {
         #expect(AudioRouteSafetyPolicy.evaluate(
             route,
             inputPolicy: .builtInMicrophoneRequired,
+            outputPolicy: .privateOutputRequired,
             trustedOutputs: []
         ) == .safe(output: output))
     }
@@ -29,16 +30,19 @@ struct AudioRouteSafetyPolicyTests {
         #expect(AudioRouteSafetyPolicy.evaluate(
             route,
             inputPolicy: .builtInMicrophoneRequired,
+            outputPolicy: .privateOutputRequired,
             trustedOutputs: []
         ) == .trustRequired(output: output))
         #expect(AudioRouteSafetyPolicy.evaluate(
             route,
             inputPolicy: .builtInMicrophoneRequired,
+            outputPolicy: .privateOutputRequired,
             trustedOutputs: [AudioTrustedOutput(output: output)]
         ) == .safe(output: output))
         #expect(AudioRouteSafetyPolicy.evaluate(
             route,
             inputPolicy: .builtInMicrophoneRequired,
+            outputPolicy: .privateOutputRequired,
             trustedOutputs: [AudioTrustedOutput(
                 id: output.id,
                 name: "Renamed Device",
@@ -58,11 +62,13 @@ struct AudioRouteSafetyPolicyTests {
         #expect(AudioRouteSafetyPolicy.evaluate(
             route,
             inputPolicy: .builtInMicrophoneRequired,
+            outputPolicy: .privateOutputRequired,
             trustedOutputs: []
         ) == .trustRequired(output: output))
         #expect(AudioRouteSafetyPolicy.evaluate(
             route,
             inputPolicy: .builtInMicrophoneRequired,
+            outputPolicy: .privateOutputRequired,
             trustedOutputs: [AudioTrustedOutput(output: output)]
         ) == .safe(output: output))
     }
@@ -76,6 +82,7 @@ struct AudioRouteSafetyPolicyTests {
         #expect(AudioRouteSafetyPolicy.evaluate(
             route,
             inputPolicy: .builtInMicrophoneRequired,
+            outputPolicy: .privateOutputRequired,
             trustedOutputs: [AudioTrustedOutput(output: output)]
         ) == .unsafe(reason: .hfpForbidden))
     }
@@ -102,6 +109,7 @@ struct AudioRouteSafetyPolicyTests {
         #expect(AudioRouteSafetyPolicy.evaluate(
             route,
             inputPolicy: .preferBuiltInAllowPrivateAccessoryDuplex,
+            outputPolicy: .privateOutputRequired,
             trustedOutputs: [AudioTrustedOutput(output: output)]
         ) == .safe(output: output))
     }
@@ -117,11 +125,13 @@ struct AudioRouteSafetyPolicyTests {
         #expect(AudioRouteSafetyPolicy.evaluate(
             route,
             inputPolicy: .builtInMicrophoneRequired,
+            outputPolicy: .privateOutputRequired,
             trustedOutputs: []
         ) == .unsafe(reason: .inputPolicyViolation))
         #expect(AudioRouteSafetyPolicy.evaluate(
             route,
             inputPolicy: .preferBuiltInAllowPrivateAccessoryDuplex,
+            outputPolicy: .privateOutputRequired,
             trustedOutputs: []
         ) == .safe(output: output))
     }
@@ -145,11 +155,13 @@ struct AudioRouteSafetyPolicyTests {
         #expect(AudioRouteSafetyPolicy.evaluate(
             missing,
             inputPolicy: .builtInMicrophoneRequired,
+            outputPolicy: .privateOutputRequired,
             trustedOutputs: []
         ) == .unsafe(reason: .inputPolicyViolation))
         #expect(AudioRouteSafetyPolicy.evaluate(
             multiple,
             inputPolicy: .preferBuiltInAllowPrivateAccessoryDuplex,
+            outputPolicy: .privateOutputRequired,
             trustedOutputs: []
         ) == .unsafe(reason: .inputPolicyViolation))
     }
@@ -167,6 +179,7 @@ struct AudioRouteSafetyPolicyTests {
         #expect(AudioRouteSafetyPolicy.evaluate(
             route,
             inputPolicy: .builtInMicrophoneRequired,
+            outputPolicy: .privateOutputRequired,
             trustedOutputs: []
         ) == .unsafe(reason: .mixedOrMultipleOutputs))
     }
@@ -187,13 +200,33 @@ struct AudioRouteSafetyPolicyTests {
         #expect(AudioRouteSafetyPolicy.evaluate(
             speakerRoute,
             inputPolicy: .builtInMicrophoneRequired,
+            outputPolicy: .privateOutputRequired,
             trustedOutputs: []
         ) == .unsafe(reason: .nonPrivateOutput))
         #expect(AudioRouteSafetyPolicy.evaluate(
             emptyRoute,
             inputPolicy: .builtInMicrophoneRequired,
+            outputPolicy: .privateOutputRequired,
             trustedOutputs: []
         ) == .unsafe(reason: .outputUnavailable))
+    }
+
+    @Test("Private-output policy rejects every public or unknown output kind")
+    func privateOutputPolicyRejectsNonPrivateKinds() {
+        let input = port("mic", kind: .builtInMicrophone)
+        let rejectedKinds = AudioRoutePortKind.allCases.filter {
+            !$0.isPotentialPrivateOutput
+        }
+
+        for kind in rejectedKinds {
+            let output = port("output-\(kind.rawValue)", kind: kind)
+            #expect(AudioRouteSafetyPolicy.evaluate(
+                route(input: input, output: output),
+                inputPolicy: .builtInMicrophoneRequired,
+                outputPolicy: .privateOutputRequired,
+                trustedOutputs: []
+            ) == .unsafe(reason: .nonPrivateOutput))
+        }
     }
 
     @Test("Only current output changes cross the playback safety boundary")

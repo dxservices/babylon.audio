@@ -47,6 +47,7 @@ public final class AudioRouteController {
 
     public func configure(
         inputPolicy: AudioInputPolicy,
+        outputPolicy: DeviceOutputPolicy,
         trustedOutputs: Set<AudioTrustedOutput>
     ) async throws -> AudioRouteConfigurationResult {
         let profiles = AudioSessionProfilePolicy.activationOrder(for: inputPolicy)
@@ -71,6 +72,7 @@ public final class AudioRouteController {
                     let safety = AudioRouteSafetyPolicy.evaluate(
                         route,
                         inputPolicy: inputPolicy,
+                        outputPolicy: outputPolicy,
                         trustedOutputs: trustedOutputs
                     )
                     lastRoute = route
