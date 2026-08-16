@@ -38,5 +38,11 @@ All notable changes to this project will be documented in this file.
   media-reset events.
 - Add the shared device-engine safety foundation; output starts muted and can
   only unmute after a safe route evaluation.
+- Add single-tap microphone capture with hardware-native PCM copying, bounded
+  newest-chunk handoff, off-callback frame assembly and format conversion, and
+  explicit stop/failure lifecycle isolation.
+- Accept hardware callback sizes up to the configured buffered-duration bound
+  and turn oversized buffers, layout failures, and handoff overflow into
+  content-free terminal capture failures instead of silent loss.
 - Extend repository checks to cover all reachable commit messages and
   extensionless text files.

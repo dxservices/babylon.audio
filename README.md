@@ -96,9 +96,27 @@ while the route remains stable.
 `AudioDeviceEngine` is the initial shared `AVAudioEngine` safety foundation.
 It starts muted, owns one player node, and refuses to unmute unless given a
 `.safe` route evaluation. Its capture and playback safety controls satisfy the
-coordinator contract. Capture taps, frame handoff, and PCM scheduling remain
-under active A4 development; Simulator compilation does not validate hardware
-route behavior.
+coordinator contract.
+
+Microphone capture installs one input-node tap using the hardware-native PCM
+format. The callback only validates the bounded frame count, copies PCM bytes,
+and offers the chunk to a bounded non-suspending handoff; it does not create a
+task, await, log, persist, perform network work, or invoke caller code. The tap
+buffer size is only a request: callbacks may contain up to the configured
+`maximumBufferedDuration`. A larger hardware buffer, invalid buffer layout, or
+handoff overflow closes the bridge with a content-free failure instead of
+silently producing zero audio. A dedicated drain task then assembles
+fixed-duration frames, performs stateful conversion to the requested format,
+and serially invokes the caller handler. Hardware-format assembler and
+converter validation completes synchronously before the tap is installed.
+
+`stopCapture()` removes the tap, closes the handoff, and requests drain-task
+cancellation, but it is not an async delivery barrier: an `onFrame` call already
+in flight may return after `stopCapture()`. Consumers must invalidate the flow
+generation and stop downstream bounded queues as part of the same safety
+transition; late delivery is then rejected by generation. PCM playback
+scheduling remains under active A4 development; Simulator compilation does not
+validate microphone or route hardware behavior.
 
 ## Non-goals
 
