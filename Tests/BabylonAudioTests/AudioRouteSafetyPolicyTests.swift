@@ -98,6 +98,14 @@ struct AudioRouteSafetyPolicyTests {
             .builtInMicrophoneWithPrivateOutput,
             .privateAccessoryDuplex,
         ])
+        #expect(
+            AudioSessionProfile.builtInMicrophoneWithPrivateOutput
+                .voiceProcessingPolicy == .disabled
+        )
+        #expect(
+            AudioSessionProfile.privateAccessoryDuplex
+                .voiceProcessingPolicy == .enabledForPrivateAccessoryDuplex
+        )
     }
 
     @Test("An explicitly allowed trusted HFP duplex route is safe")

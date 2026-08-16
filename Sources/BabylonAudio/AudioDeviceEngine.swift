@@ -114,6 +114,9 @@ protocol AudioDeviceEngineBackend: AnyObject {
     func start() throws
     func stop()
     func configurePlayback(format: AudioStreamFormat) throws
+    func configureVoiceProcessing(
+        _ policy: AudioVoiceProcessingPolicy
+    ) throws
     func schedulePlayback(_ frame: AudioFrame) async throws
     func setOutputMuted(_ muted: Bool)
     func startCapture(
@@ -136,6 +139,8 @@ public final class AudioDeviceEngine:
     public private(set) var isOutputMuted = true
     public private(set) var isCapturing = false
     public private(set) var playbackFormat: AudioStreamFormat?
+    public private(set) var voiceProcessingPolicy:
+        AudioVoiceProcessingPolicy = .disabled
 
     private let backend: any AudioDeviceEngineBackend
 
@@ -155,6 +160,16 @@ public final class AudioDeviceEngine:
         }
         try backend.configurePlayback(format: format)
         playbackFormat = format
+    }
+
+    public func configureVoiceProcessing(
+        _ policy: AudioVoiceProcessingPolicy
+    ) throws {
+        guard !isRunning else {
+            throw AudioDeviceEngineError.engineAlreadyRunning
+        }
+        try backend.configureVoiceProcessing(policy)
+        voiceProcessingPolicy = policy
     }
 
     public func consume(_ frame: AudioFrame) async throws {
@@ -239,6 +254,7 @@ public final class AudioDeviceEngine:
         isOutputMuted = true
         isCapturing = false
         playbackFormat = nil
+        voiceProcessingPolicy = .disabled
     }
 
     private func captureDidFail() {
@@ -298,6 +314,15 @@ private final class AVAudioDeviceEngineBackend: AudioDeviceEngineBackend {
         engine.connect(playerNode, to: engine.mainMixerNode, format: avFormat)
         playbackFormat = format
         playbackAVFormat = avFormat
+    }
+
+    func configureVoiceProcessing(
+        _ policy: AudioVoiceProcessingPolicy
+    ) throws {
+        guard !engine.isRunning else {
+            throw AudioDeviceEngineError.engineAlreadyRunning
+        }
+        try engine.inputNode.setVoiceProcessingEnabled(policy != .disabled)
     }
 
     func schedulePlayback(_ frame: AudioFrame) async throws {

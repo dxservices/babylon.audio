@@ -5,6 +5,29 @@ import Testing
 @Suite("Audio device engine")
 @MainActor
 struct AudioDeviceEngineTests {
+    @Test("Voice processing is disabled by default and requires pre-start opt-in")
+    func voiceProcessingRequiresExplicitPreStartOptIn() throws {
+        let backend = RecordingDeviceEngineBackend()
+        let engine = AudioDeviceEngine(backend: backend)
+
+        #expect(engine.voiceProcessingPolicy == .disabled)
+        try engine.configureVoiceProcessing(
+            .enabledForPrivateAccessoryDuplex
+        )
+        #expect(
+            engine.voiceProcessingPolicy
+                == .enabledForPrivateAccessoryDuplex
+        )
+        try engine.start()
+        #expect(throws: AudioDeviceEngineError.engineAlreadyRunning) {
+            try engine.configureVoiceProcessing(.disabled)
+        }
+        #expect(backend.actions == [
+            .configureVoiceProcessing(.enabledForPrivateAccessoryDuplex),
+            .start,
+        ])
+    }
+
     @Test("Playback format must be configured before the engine starts")
     func playbackConfigurationPrecedesEngineStart() async throws {
         let format = try AudioStreamFormat.monoPCM16(sampleRate: 24_000)
@@ -241,6 +264,9 @@ struct AudioDeviceEngineTests {
             name: "Wired Headphones",
             kind: .wiredHeadphones
         )
+        try engine.configureVoiceProcessing(
+            .enabledForPrivateAccessoryDuplex
+        )
         try engine.configurePlayback(format: format)
         try engine.start()
         try engine.unmuteOutput(after: .safe(output: output))
@@ -264,6 +290,7 @@ struct AudioDeviceEngineTests {
         #expect(engine.isOutputMuted)
         #expect(!engine.isCapturing)
         #expect(engine.playbackFormat == nil)
+        #expect(engine.voiceProcessingPolicy == .disabled)
         #expect(backend.actions.last == .rebuildMediaServicesGraph)
 
         try engine.configurePlayback(format: format)
@@ -302,6 +329,7 @@ private final class RecordingDeviceEngineBackend: AudioDeviceEngineBackend {
         case start
         case stop
         case configurePlayback(AudioStreamFormat)
+        case configureVoiceProcessing(AudioVoiceProcessingPolicy)
         case schedulePlayback(UInt64)
         case setOutputMuted(Bool)
         case startCapture(AudioCaptureConfiguration)
@@ -333,6 +361,12 @@ private final class RecordingDeviceEngineBackend: AudioDeviceEngineBackend {
 
     func configurePlayback(format: AudioStreamFormat) throws {
         actions.append(.configurePlayback(format))
+    }
+
+    func configureVoiceProcessing(
+        _ policy: AudioVoiceProcessingPolicy
+    ) throws {
+        actions.append(.configureVoiceProcessing(policy))
     }
 
     func schedulePlayback(_ frame: AudioFrame) async throws {

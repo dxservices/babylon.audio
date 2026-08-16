@@ -34,6 +34,10 @@ All notable changes to this project will be documented in this file.
   configuration attempt after trust is recorded.
 - Require explicit microphone-source and private-device-output policies across
   pipeline configuration, route configuration, and actual-route evaluation.
+- Make voice-processing intent explicit on session profiles and require a
+  pre-start device-engine opt-in for VPIO; stable unsafe routes use a configurable
+  unchanged-snapshot threshold, while selected HFP inputs retain the full settle
+  window.
 - Add device-event observation and a fail-closed safety coordinator that mutes,
   stops capture and playback, invalidates both streaming generations,
   deactivates the session, and only then delivers route, interruption, or

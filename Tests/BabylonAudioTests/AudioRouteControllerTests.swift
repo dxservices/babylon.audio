@@ -128,6 +128,127 @@ struct AudioRouteControllerTests {
         ])
     }
 
+    @Test("Stable unsafe routes use the configured confirmation threshold")
+    func stableUnsafeRoutesExitEarly() async throws {
+        let waitCounter = RouteWaitCounter()
+        let backend = RecordingAudioSessionBackend(
+            builtInRoute: makeRoute(
+                input: port("mic", kind: .builtInMicrophone),
+                output: port("speaker", kind: .builtInSpeaker)
+            ),
+            duplexRoute: .empty
+        )
+        let controller = AudioRouteController(
+            session: backend,
+            observationAttempts: 30,
+            stableUnsafeConfirmations: 2,
+            waitForRouteUpdate: {
+                waitCounter.count += 1
+            }
+        )
+
+        let result = try await controller.configure(
+            inputPolicy: .preferBuiltInAllowPrivateAccessoryDuplex,
+            outputPolicy: .privateOutputRequired,
+            trustedOutputs: []
+        )
+
+        #expect(result.safety == .unsafe(reason: .outputUnavailable))
+        #expect(waitCounter.count == 6)
+        #expect(backend.actions == [
+            .activate(.builtInMicrophoneWithPrivateOutput),
+            .deactivate,
+            .activate(.privateAccessoryDuplex),
+            .deactivate,
+        ])
+    }
+
+    @Test("Selected duplex input gets the full route-change observation window")
+    func selectedDuplexInputDisablesEarlyExit() async throws {
+        let waitCounter = RouteWaitCounter()
+        let hfpInput = port("headset-mic", kind: .bluetoothHFP)
+        let hfpOutput = port("headset", kind: .bluetoothHFP)
+        let settlingRoute = AudioRouteSnapshot(
+            inputs: [port("mic", kind: .builtInMicrophone)],
+            outputs: [port("speaker", kind: .builtInSpeaker)],
+            availableInputs: [hfpInput]
+        )
+        let backend = RecordingAudioSessionBackend(
+            builtInRoute: makeRoute(
+                input: port("mic", kind: .builtInMicrophone),
+                output: port("speaker", kind: .builtInSpeaker)
+            ),
+            duplexRoute: settlingRoute
+        )
+        let controller = AudioRouteController(
+            session: backend,
+            observationAttempts: 10,
+            stableUnsafeConfirmations: 1,
+            waitForRouteUpdate: {
+                waitCounter.count += 1
+                if waitCounter.count == 5 {
+                    backend.setRouteSnapshot(AudioRouteSnapshot(
+                        inputs: [hfpInput],
+                        outputs: [hfpOutput],
+                        availableInputs: [hfpInput]
+                    ))
+                }
+            }
+        )
+
+        let result = try await controller.configure(
+            inputPolicy: .preferBuiltInAllowPrivateAccessoryDuplex,
+            outputPolicy: .privateOutputRequired,
+            trustedOutputs: [AudioTrustedOutput(output: hfpOutput)]
+        )
+
+        #expect(result.safety == .safe(output: hfpOutput))
+        #expect(waitCounter.count == 5)
+        #expect(backend.actions == [
+            .activate(.builtInMicrophoneWithPrivateOutput),
+            .deactivate,
+            .activate(.privateAccessoryDuplex),
+            .selectInput(id: hfpInput.id),
+        ])
+    }
+
+    @Test("A changed route continues observation and may become safe")
+    func changedRouteContinuesObservation() async throws {
+        let waitCounter = RouteWaitCounter()
+        let safeOutput = port("wired", kind: .wiredHeadphones)
+        let backend = RecordingAudioSessionBackend(
+            builtInRoute: makeRoute(
+                input: port("mic", kind: .builtInMicrophone),
+                output: port("speaker", kind: .builtInSpeaker)
+            ),
+            duplexRoute: .empty
+        )
+        let controller = AudioRouteController(
+            session: backend,
+            observationAttempts: 30,
+            waitForRouteUpdate: {
+                waitCounter.count += 1
+                backend.setRouteSnapshot(AudioRouteSnapshot(
+                    inputs: [self.port("mic", kind: .builtInMicrophone)],
+                    outputs: [safeOutput],
+                    availableInputs: []
+                ))
+            }
+        )
+
+        let result = try await controller.configure(
+            inputPolicy: .builtInMicrophoneRequired,
+            outputPolicy: .privateOutputRequired,
+            trustedOutputs: []
+        )
+
+        #expect(result.safety == .safe(output: safeOutput))
+        #expect(waitCounter.count == 1)
+        #expect(backend.actions == [
+            .activate(.builtInMicrophoneWithPrivateOutput),
+        ])
+    }
+
     private func port(
         _ id: String,
         kind: AudioRoutePortKind
@@ -145,6 +266,11 @@ struct AudioRouteControllerTests {
             availableInputs: []
         )
     }
+}
+
+@MainActor
+private final class RouteWaitCounter {
+    var count = 0
 }
 
 @MainActor
@@ -192,6 +318,10 @@ private final class RecordingAudioSessionBackend: AudioSessionControlling {
     func selectPrivateAccessoryInput(id: String) throws -> Bool {
         actions.append(.selectInput(id: id))
         return true
+    }
+
+    func setRouteSnapshot(_ route: AudioRouteSnapshot) {
+        routeSnapshot = route
     }
 }
 

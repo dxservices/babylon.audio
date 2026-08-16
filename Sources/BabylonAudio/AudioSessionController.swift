@@ -159,10 +159,10 @@ public final class AudioSessionController {
 @available(iOS 18, *)
 private extension AudioSessionProfile {
     var mode: AVAudioSession.Mode {
-        switch self {
-        case .builtInMicrophoneWithPrivateOutput:
+        switch voiceProcessingPolicy {
+        case .disabled:
             .default
-        case .privateAccessoryDuplex:
+        case .enabledForPrivateAccessoryDuplex:
             .voiceChat
         }
     }

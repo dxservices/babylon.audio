@@ -81,6 +81,19 @@ The iOS `AudioSessionController.shared` is the package-owned low-level
 `AVAudioSession` adapter; preference success never substitutes for inspecting
 its resulting `routeSnapshot`.
 
+The built-in-microphone profile exposes `.disabled` voice processing and uses
+the default session mode. Only the explicitly allowed private-accessory-duplex
+profile exposes `.enabledForPrivateAccessoryDuplex` and uses `.voiceChat`.
+`AudioDeviceEngine.configureVoiceProcessing` is a separate pre-start opt-in
+that enables the input node's Voice Processing I/O; the engine defaults to
+disabled and reset restores that default. `AudioPipelineSession` must wire the
+active profile policy into the engine in A5. Stable unsafe route and input-
+discovery snapshots stop polling after a configurable number of unchanged
+confirmation samples; the device default is five at 100 ms intervals. Any
+snapshot change continues observation up to the configured bound. If a private
+accessory input was successfully selected, that duplex profile disables early
+exit for the whole observation round so SCO setup gets the full window.
+
 Microphone selection is represented only by
 `AudioSourceConfiguration.microphone(policy:)`; caller-provided PCM uses
 `.externalFrames` or `.external`. Device playback is represented only by

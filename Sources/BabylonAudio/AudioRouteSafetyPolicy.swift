@@ -111,6 +111,20 @@ public enum AudioRouteSafetyEvaluation: Equatable, Sendable {
 public enum AudioSessionProfile: Equatable, Sendable {
     case builtInMicrophoneWithPrivateOutput
     case privateAccessoryDuplex
+
+    public var voiceProcessingPolicy: AudioVoiceProcessingPolicy {
+        switch self {
+        case .builtInMicrophoneWithPrivateOutput:
+            .disabled
+        case .privateAccessoryDuplex:
+            .enabledForPrivateAccessoryDuplex
+        }
+    }
+}
+
+public enum AudioVoiceProcessingPolicy: Equatable, Sendable {
+    case disabled
+    case enabledForPrivateAccessoryDuplex
 }
 
 public enum AudioSessionProfilePolicy {

@@ -32,16 +32,20 @@ public final class AudioRouteController {
 
     private let session: any AudioSessionControlling
     private let observationAttempts: Int
+    private let stableUnsafeConfirmations: Int
     private let waitForRouteUpdate: @MainActor @Sendable () async throws -> Void
 
     init(
         session: any AudioSessionControlling,
         observationAttempts: Int,
+        stableUnsafeConfirmations: Int = 5,
         waitForRouteUpdate: @escaping @MainActor @Sendable () async throws -> Void
     ) {
         precondition(observationAttempts > 0)
+        precondition(stableUnsafeConfirmations > 0)
         self.session = session
         self.observationAttempts = observationAttempts
+        self.stableUnsafeConfirmations = stableUnsafeConfirmations
         self.waitForRouteUpdate = waitForRouteUpdate
     }
 
@@ -63,11 +67,17 @@ public final class AudioRouteController {
                 }
                 try session.activate(profile)
 
+                let selectedPrivateAccessoryInput: Bool
                 if profile == .privateAccessoryDuplex {
-                    try await selectDiscoveredPrivateAccessoryInput()
+                    selectedPrivateAccessoryInput =
+                        try await selectDiscoveredPrivateAccessoryInput()
+                } else {
+                    selectedPrivateAccessoryInput = false
                 }
 
-                for attempt in 0..<observationAttempts {
+                var previousUnsafeRoute: AudioRouteSnapshot?
+                var unchangedUnsafeConfirmations = 0
+                observation: for attempt in 0..<observationAttempts {
                     let route = session.routeSnapshot
                     let safety = AudioRouteSafetyPolicy.evaluate(
                         route,
@@ -97,7 +107,18 @@ public final class AudioRouteController {
                         lastResult = result
                         return result
                     case .unsafe:
-                        break
+                        if route == previousUnsafeRoute {
+                            unchangedUnsafeConfirmations += 1
+                            if !selectedPrivateAccessoryInput,
+                               unchangedUnsafeConfirmations
+                                >= stableUnsafeConfirmations
+                            {
+                                break observation
+                            }
+                        } else {
+                            previousUnsafeRoute = route
+                            unchangedUnsafeConfirmations = 0
+                        }
                     }
 
                     if attempt + 1 < observationAttempts {
@@ -120,20 +141,32 @@ public final class AudioRouteController {
         }
     }
 
-    private func selectDiscoveredPrivateAccessoryInput() async throws {
+    private func selectDiscoveredPrivateAccessoryInput() async throws -> Bool {
+        var previousSnapshot: AudioRouteSnapshot?
+        var unchangedConfirmations = 0
         for attempt in 0..<observationAttempts {
             // AVAudioSession does not pair available inputs with outputs here.
             // Preserve system discovery order, then verify the resulting route.
-            if let input = session.routeSnapshot.availableInputs.first(where: {
+            let snapshot = session.routeSnapshot
+            if let input = snapshot.availableInputs.first(where: {
                 $0.kind.isPrivateInputCandidate
             }) {
-                _ = try session.selectPrivateAccessoryInput(id: input.id)
-                return
+                return try session.selectPrivateAccessoryInput(id: input.id)
+            }
+            if snapshot == previousSnapshot {
+                unchangedConfirmations += 1
+                if unchangedConfirmations >= stableUnsafeConfirmations {
+                    return false
+                }
+            } else {
+                previousSnapshot = snapshot
+                unchangedConfirmations = 0
             }
             if attempt + 1 < observationAttempts {
                 try await waitForRouteUpdate()
             }
         }
+        return false
     }
 }
 
@@ -147,6 +180,7 @@ public extension AudioRouteController {
         self.init(
             session: session,
             observationAttempts: 30,
+            stableUnsafeConfirmations: 5,
             waitForRouteUpdate: {
                 try await Task.sleep(for: .milliseconds(100))
             }
