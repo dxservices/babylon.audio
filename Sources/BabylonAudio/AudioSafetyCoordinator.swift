@@ -27,6 +27,8 @@ public protocol AudioHardwareSafetyControlling: AnyObject {
     func muteOutput()
     func stopCapture()
     func stopPlayback()
+    /// Replaces audio objects invalidated by a media-services reset.
+    func rebuildAfterMediaServicesReset()
 }
 
 @available(iOS 18, macOS 13, *)
@@ -107,6 +109,10 @@ public final class AudioSafetyCoordinator {
                 sessionDeactivated = true
             } catch {
                 sessionDeactivated = false
+            }
+
+            if case .mediaServicesReset = event {
+                hardware.rebuildAfterMediaServicesReset()
             }
 
             await eventSink.receive(event)

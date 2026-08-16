@@ -123,6 +123,7 @@ protocol AudioDeviceEngineBackend: AnyObject {
     ) throws
     func stopCapture()
     func stopPlayback()
+    func rebuildAfterMediaServicesReset()
 }
 
 @available(iOS 18, macOS 13, *)
@@ -227,6 +228,19 @@ public final class AudioDeviceEngine:
         backend.stopPlayback()
     }
 
+    /// Replaces the graph invalidated by `mediaServicesWereReset`.
+    ///
+    /// `AudioSafetyCoordinator` calls this only after latching output closed,
+    /// stopping both data-plane sides, discarding queues, and deactivating the
+    /// session. The consumer must configure and start the fresh graph again.
+    public func rebuildAfterMediaServicesReset() {
+        backend.rebuildAfterMediaServicesReset()
+        isRunning = false
+        isOutputMuted = true
+        isCapturing = false
+        playbackFormat = nil
+    }
+
     private func captureDidFail() {
         isCapturing = false
     }
@@ -245,10 +259,11 @@ public extension AudioDeviceEngine {
 @available(iOS 18, *)
 @MainActor
 private final class AVAudioDeviceEngineBackend: AudioDeviceEngineBackend {
-    private let engine = AVAudioEngine()
-    private let playerNode = AVAudioPlayerNode()
+    private var engine: AVAudioEngine
+    private var playerNode: AVAudioPlayerNode
     private var playbackFormat: AudioStreamFormat?
     private var playbackAVFormat: AVAudioFormat?
+    /// Monotonic across graph rebuilds so late completions cannot collide.
     private var nextPlaybackID: UInt64 = 0
     private var playbackCompletions:
         [UInt64: AudioPlaybackCompletionBridge] = [:]
@@ -257,8 +272,9 @@ private final class AVAudioDeviceEngineBackend: AudioDeviceEngineBackend {
     private var captureTask: Task<Void, Never>?
 
     init() {
-        engine.attach(playerNode)
-        playerNode.volume = 0
+        let graph = Self.makeGraph()
+        engine = graph.engine
+        playerNode = graph.playerNode
     }
 
     func start() throws {
@@ -425,8 +441,31 @@ private final class AVAudioDeviceEngineBackend: AudioDeviceEngineBackend {
         playerNode.stop()
     }
 
+    func rebuildAfterMediaServicesReset() {
+        stopCapture()
+        stopPlayback()
+        engine.stop()
+
+        let graph = Self.makeGraph()
+        engine = graph.engine
+        playerNode = graph.playerNode
+        playbackFormat = nil
+        playbackAVFormat = nil
+    }
+
     private func stopCaptureAfterFailure() {
         stopCapture()
+    }
+
+    private static func makeGraph() -> (
+        engine: AVAudioEngine,
+        playerNode: AVAudioPlayerNode
+    ) {
+        let engine = AVAudioEngine()
+        let playerNode = AVAudioPlayerNode()
+        engine.attach(playerNode)
+        playerNode.volume = 0
+        return (engine, playerNode)
     }
 
     private nonisolated static func makeAudioStreamFormat(

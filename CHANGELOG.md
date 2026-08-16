@@ -47,5 +47,7 @@ All notable changes to this project will be documented in this file.
 - Add exact-format shared-engine PCM playback through `AudioFrameSink`, with
   data-consumed completion handoff and deterministic pending-consume failure on
   playback stop.
+- Rebuild invalid engine and player-node objects after a media-services reset,
+  leaving a fresh stopped, muted, and unconfigured graph before caller delivery.
 - Extend repository checks to cover all reachable commit messages and
   extensionless text files.

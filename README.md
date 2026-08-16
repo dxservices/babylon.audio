@@ -83,7 +83,9 @@ stops playback, invalidates both streaming flow generations, deactivates the
 audio session, and only then delivers the device event to the caller. An
 interruption-ended event never resumes hardware automatically. Session
 deactivation failure is reported as a content-free boolean result and cannot
-skip consumer delivery.
+skip consumer delivery. For a media-services reset, the coordinator additionally
+replaces the invalid device-engine graph after deactivation and before consumer
+delivery; it never asks the caller to recover against stale audio objects.
 
 The consumer must retain the coordinator until both the device engine and
 audio session are no longer in use. Its convenience initializer installs the
@@ -96,7 +98,11 @@ while the route remains stable.
 `AudioDeviceEngine` is the initial shared `AVAudioEngine` safety foundation.
 It starts muted, owns one player node, and refuses to unmute unless given a
 `.safe` route evaluation. Its capture and playback safety controls satisfy the
-coordinator contract.
+coordinator contract. A media-services reset discards the old engine and player
+node, cancels their pending work, and creates a fresh stopped and muted graph.
+Running, capture, and playback-format state is cleared, so recovery requires an
+explicit session configuration, playback-format configuration, engine start,
+and safe-route unmute.
 
 Microphone capture installs one input-node tap using the hardware-native PCM
 format. The callback only validates the bounded frame count, copies PCM bytes,

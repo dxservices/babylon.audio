@@ -10,7 +10,6 @@ struct AudioSafetyCoordinatorTests {
         let events: [AudioDeviceEvent] = [
             .routeChanged(.empty),
             .interruptionBegan,
-            .mediaServicesReset,
         ]
 
         for event in events {
@@ -37,6 +36,37 @@ struct AudioSafetyCoordinatorTests {
                 .deliverEvent(event),
             ])
         }
+    }
+
+    @Test("Media reset rebuilds before delivery even if deactivation fails")
+    func mediaResetRebuildsBeforeDelivery() async {
+        let recorder = SafetyActionRecorder()
+        let event = AudioDeviceEvent.mediaServicesReset
+        let coordinator = AudioSafetyCoordinator(
+            hardware: RecordingHardware(recorder: recorder),
+            buffers: RecordingBuffers(recorder: recorder),
+            session: RecordingSafetySession(
+                recorder: recorder,
+                deactivationFails: true
+            ),
+            eventSink: RecordingDeviceEventSink(recorder: recorder)
+        )
+
+        let result = await coordinator.handle(event)
+
+        #expect(result == AudioSafetyHandlingResult(
+            engagedSafetyBoundary: true,
+            sessionDeactivated: false
+        ))
+        #expect(recorder.actions == [
+            .muteOutput,
+            .stopCapture,
+            .stopPlayback,
+            .discardPendingAudio,
+            .deactivateSession,
+            .rebuildMediaServicesGraph,
+            .deliverEvent(event),
+        ])
     }
 
     @Test("A deactivation failure cannot skip consumer delivery")
@@ -145,6 +175,7 @@ private final class SafetyActionRecorder {
         case stopPlayback
         case discardPendingAudio
         case deactivateSession
+        case rebuildMediaServicesGraph
         case deliverEvent(AudioDeviceEvent)
     }
 
@@ -169,6 +200,10 @@ private final class RecordingHardware: AudioHardwareSafetyControlling {
 
     func stopPlayback() {
         recorder.actions.append(.stopPlayback)
+    }
+
+    func rebuildAfterMediaServicesReset() {
+        recorder.actions.append(.rebuildMediaServicesGraph)
     }
 }
 

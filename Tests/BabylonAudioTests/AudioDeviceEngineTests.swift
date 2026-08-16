@@ -231,6 +231,46 @@ struct AudioDeviceEngineTests {
         ])
     }
 
+    @Test("Media reset clears public state and rebuilds an unconfigured graph")
+    func mediaResetRebuildsFreshGraph() async throws {
+        let backend = RecordingDeviceEngineBackend()
+        let engine = AudioDeviceEngine(backend: backend)
+        let format = try AudioStreamFormat.monoPCM16(sampleRate: 24_000)
+        let output = AudioRoutePort(
+            id: "wired",
+            name: "Wired Headphones",
+            kind: .wiredHeadphones
+        )
+        try engine.configurePlayback(format: format)
+        try engine.start()
+        try engine.unmuteOutput(after: .safe(output: output))
+        try engine.startCapture(
+            configuration: makeCaptureConfiguration()
+        ) { _ in }
+        let consumption = Task {
+            try await engine.consume(makePlaybackFrame(format: format))
+        }
+        for _ in 0..<10 { await Task.yield() }
+
+        engine.rebuildAfterMediaServicesReset()
+
+        do {
+            try await consumption.value
+            Issue.record("Expected reset to fail pending playback")
+        } catch {
+            #expect(error as? AudioDeviceEngineError == .playbackStopped)
+        }
+        #expect(!engine.isRunning)
+        #expect(engine.isOutputMuted)
+        #expect(!engine.isCapturing)
+        #expect(engine.playbackFormat == nil)
+        #expect(backend.actions.last == .rebuildMediaServicesGraph)
+
+        try engine.configurePlayback(format: format)
+        #expect(engine.playbackFormat == format)
+        #expect(backend.actions.last == .configurePlayback(format))
+    }
+
     private func makeCaptureConfiguration() throws -> AudioCaptureConfiguration {
         try AudioCaptureConfiguration(
             flowID: AudioFlowID(),
@@ -267,6 +307,7 @@ private final class RecordingDeviceEngineBackend: AudioDeviceEngineBackend {
         case startCapture(AudioCaptureConfiguration)
         case stopCapture
         case stopPlayback
+        case rebuildMediaServicesGraph
     }
 
     private(set) var actions: [Action] = []
@@ -324,6 +365,15 @@ private final class RecordingDeviceEngineBackend: AudioDeviceEngineBackend {
 
     func stopPlayback() {
         actions.append(.stopPlayback)
+        let pending = Array(playbackContinuations.values)
+        playbackContinuations.removeAll()
+        for continuation in pending {
+            continuation.resume(throwing: AudioDeviceEngineError.playbackStopped)
+        }
+    }
+
+    func rebuildAfterMediaServicesReset() {
+        actions.append(.rebuildMediaServicesGraph)
         let pending = Array(playbackContinuations.values)
         playbackContinuations.removeAll()
         for continuation in pending {
