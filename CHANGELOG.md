@@ -32,5 +32,11 @@ All notable changes to this project will be documented in this file.
   built-in-microphone-required policy. An untrusted Bluetooth result
   deactivates the session before caller confirmation and requires a fresh
   configuration attempt after trust is recorded.
+- Add device-event observation and a fail-closed safety coordinator that mutes,
+  stops capture and playback, invalidates both streaming generations,
+  deactivates the session, and only then delivers route, interruption, or
+  media-reset events.
+- Add the shared device-engine safety foundation; output starts muted and can
+  only unmute after a safe route evaluation.
 - Extend repository checks to cover all reachable commit messages and
   extensionless text files.

@@ -77,6 +77,29 @@ The iOS `AudioSessionController.shared` is the package-owned low-level
 `AVAudioSession` adapter; preference success never substitutes for inspecting
 its resulting `routeSnapshot`.
 
+`AudioSafetyCoordinator` connects route-change, interruption, and media-reset
+facts to a fixed fail-closed sequence. It latches output mute, stops capture,
+stops playback, invalidates both streaming flow generations, deactivates the
+audio session, and only then delivers the device event to the caller. An
+interruption-ended event never resumes hardware automatically. Session
+deactivation failure is reported as a content-free boolean result and cannot
+skip consumer delivery.
+
+The consumer must retain the coordinator until both the device engine and
+audio session are no longer in use. Its convenience initializer installs the
+session authority's sole event handler; consumers must not replace that handler
+while hardware is active. Every route-change notification deliberately enters
+the safety boundary, including changes that may be favorable. Route-reason
+specialization is a later optimization, so continuity guarantees apply only
+while the route remains stable.
+
+`AudioDeviceEngine` is the initial shared `AVAudioEngine` safety foundation.
+It starts muted, owns one player node, and refuses to unmute unless given a
+`.safe` route evaluation. Its capture and playback safety controls satisfy the
+coordinator contract. Capture taps, frame handoff, and PCM scheduling remain
+under active A4 development; Simulator compilation does not validate hardware
+route behavior.
+
 ## Non-goals
 
 BabylonAudio does not promise to:
