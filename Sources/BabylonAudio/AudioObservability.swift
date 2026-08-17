@@ -14,6 +14,11 @@ public enum AudioEvent: Equatable, Sendable {
     case endpointFailed(flowID: AudioFlowID, direction: AudioDirection)
 }
 
+@available(iOS 18, macOS 13, *)
+public protocol AudioEventSink: Sendable {
+    func receive(_ event: AudioEvent) async
+}
+
 public enum AudioDirection: Equatable, Sendable {
     case localMonitor
     case uplink

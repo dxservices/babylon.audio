@@ -135,9 +135,11 @@ struct BoundedDownlinkJitterBufferTests {
         await sink.completeNext()
         #expect(await eventuallyDownlink { await sink.consumedSequences() == [0, 1] })
         await sink.completeNext()
-        #expect(await eventuallyDownlink { await buffer.snapshot.rebufferCount == 1 })
+        #expect(await eventuallyDownlink { !(await buffer.snapshot.isDelivering) })
+        #expect(await buffer.snapshot.rebufferCount == 0)
 
         await buffer.enqueue(try makeDownlinkFrame(flowID: flowID, sequence: 2))
+        #expect(await eventuallyDownlink { await buffer.snapshot.rebufferCount == 1 })
         for _ in 0..<10 { await Task.yield() }
         #expect(await sink.consumedSequences() == [0, 1])
         await buffer.enqueue(try makeDownlinkFrame(flowID: flowID, sequence: 3))
@@ -151,6 +153,29 @@ struct BoundedDownlinkJitterBufferTests {
         await sink.completeNext()
         #expect(await eventuallyDownlink { await sink.consumedSequences() == [0, 1, 2, 3] })
         await sink.completeNext()
+    }
+
+    @Test("Source end after a natural drain does not count as rebuffering")
+    func sourceEndAfterNaturalDrainIsNotRebuffering() async throws {
+        let flowID = AudioFlowID()
+        let sink = ControlledDownlinkSink()
+        let buffer = BoundedDownlinkJitterBuffer(
+            policy: try BoundedDownlinkJitterBufferPolicy(
+                targetBufferedAudioDuration: .milliseconds(20),
+                maximumBufferedAudioDuration: .seconds(1),
+                maximumFrameAge: .seconds(2)
+            )
+        )
+        await buffer.start(flowID: flowID, sink: sink)
+        await buffer.enqueue(try makeDownlinkFrame(flowID: flowID, sequence: 0))
+        #expect(await eventuallyDownlink { await sink.consumedSequences() == [0] })
+
+        await sink.completeNext()
+        #expect(await eventuallyDownlink { !(await buffer.snapshot.isDelivering) })
+        #expect(await buffer.finishSource(flowID: flowID))
+
+        #expect(await buffer.snapshot.rebufferCount == 0)
+        #expect(!(await buffer.snapshot.isRunning))
     }
 
     @Test("Stop clears pending work and late sink completion cannot resume delivery")

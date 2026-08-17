@@ -27,6 +27,7 @@ public struct AudioPipelineConfiguration: Sendable {
     public let uplinkSender: (any AudioFrameSender)?
     public let downlinkReceiver: (any AudioFrameReceiver)?
     public let downlinkSink: AudioSinkConfiguration?
+    public let eventSink: (any AudioEventSink)?
     public let diagnosticSink: (any AudioDiagnosticSink)?
 
     public init(
@@ -35,6 +36,7 @@ public struct AudioPipelineConfiguration: Sendable {
         uplinkSender: (any AudioFrameSender)? = nil,
         downlinkReceiver: (any AudioFrameReceiver)? = nil,
         downlinkSink: AudioSinkConfiguration? = nil,
+        eventSink: (any AudioEventSink)? = nil,
         diagnosticSink: (any AudioDiagnosticSink)? = nil
     ) throws {
         let hasSourceDrivenPlan = localMonitorSink != nil || uplinkSender != nil
@@ -58,6 +60,7 @@ public struct AudioPipelineConfiguration: Sendable {
         self.uplinkSender = uplinkSender
         self.downlinkReceiver = downlinkReceiver
         self.downlinkSink = downlinkSink
+        self.eventSink = eventSink
         self.diagnosticSink = diagnosticSink
     }
 }

@@ -50,12 +50,45 @@ duration again after starvation. Duplicate or already-delivered sequences are
 discarded. A sink's `consume` operation must complete at the data-consumed
 scheduling boundary, not after audible playback completes.
 
+`finishSource(flowID:)` is the explicit end-of-stream boundary. It bypasses the
+normal prebuffer target for the accepted tail and returns only after that tail
+is consumed, or `false` if stop, replacement, or failure wins the transition.
+Draining to zero only creates a pending starvation observation. Rebuffering is
+counted when a later accepted frame actually recovers that flow, so a receiver
+completion that follows its last sink completion is not misclassified as
+rebuffering.
+
 The initial policies use a one-second maximum buffer, a 1.5-second maximum
 frame age, and a 200-millisecond downlink target. These are configurable
 starting points, not provider guarantees. Stop, replacement, and endpoint
 failure invalidate the active flow generation so late completions cannot
 restart old work. Snapshots and optional diagnostics contain counts, durations,
 latencies, and discard reasons only.
+
+## Pipeline session
+
+The initial `AudioPipelineSession` vertical slice owns a downlink receiver task,
+one bounded jitter buffer, an external sink, and their shared flow generation.
+It emits `flowStarted`, then `sourceEnded` when the receiver stream completes,
+drains any sub-target tail, and emits `flowStopped(.sourceEnded)` only after the
+sink has consumed every accepted frame. Receiver failure reports the downlink
+endpoint before stopping, and sink failure enters the same lifecycle through
+the jitter buffer's failure handler. Both receiver and sink failures discard
+pending audio with the `endpointFailure` reason. Caller stop invalidates the
+generation and prevents a late tail completion from producing another stop
+event.
+
+Session events are serialized through completion even when lifecycle methods
+overlap. An `AudioEventSink` must return after handing the event to its consumer
+state machine; it must not await a lifecycle method on the same session because
+that method may be waiting for the current event delivery to finish. Each flow
+identifier is single-use within one session instance, so a late completion can
+never match a later generation that happens to reuse the same identifier.
+
+This first slice intentionally rejects source-driven plans and device sinks at
+start. Later A5 slices add the shared local-monitor/uplink source path and wire
+microphone and private-device policies through the route controller and shared
+device engine.
 
 ## Device and route policy
 

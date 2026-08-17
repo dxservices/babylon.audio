@@ -111,6 +111,9 @@ public actor BoundedDownlinkJitterBuffer {
     private var isRunning = false
     private var isDelivering = false
     private var requiresTargetBuffer = true
+    private var sourceHasEnded = false
+    private var isAwaitingRebufferRecovery = false
+    private var sourceEndWaiters: [CheckedContinuation<Bool, Never>] = []
     private var droppedOverflowFrameCount: UInt64 = 0
     private var droppedExpiredFrameCount: UInt64 = 0
     private var droppedOutOfOrderFrameCount: UInt64 = 0
@@ -190,6 +193,38 @@ public actor BoundedDownlinkJitterBuffer {
         enqueue(frame, generation: generation)
     }
 
+    /// Marks the receiver stream complete and drains any tail below the normal
+    /// prebuffer target. Returns only after all accepted frames are consumed,
+    /// or `false` if the flow is stopped, replaced, or fails first.
+    public func finishSource(flowID: AudioFlowID) async -> Bool {
+        guard let generation = activeGeneration,
+              generation.flowID == flowID,
+              isRunning
+        else {
+            return false
+        }
+
+        markSourceEnded(generation: generation)
+        guard activeGeneration == generation, isRunning else {
+            return true
+        }
+        return await withCheckedContinuation { continuation in
+            sourceEndWaiters.append(continuation)
+        }
+    }
+
+    /// Fails the active receiver side and discards pending audio as an endpoint
+    /// failure. The configured failure handler is invoked exactly once.
+    public func failSource(flowID: AudioFlowID, error: any Error) {
+        guard let generation = activeGeneration,
+              generation.flowID == flowID,
+              isRunning
+        else {
+            return
+        }
+        endpointFailed(error, generation: generation)
+    }
+
     public func stop() {
         receiverTask?.cancel()
         receiverTask = nil
@@ -200,7 +235,10 @@ public actor BoundedDownlinkJitterBuffer {
         sink = nil
         failureHandler = nil
         inFlightAudioDuration = .zero
+        sourceHasEnded = false
+        isAwaitingRebufferRecovery = false
         discardPending(reason: .stopped)
+        resumeSourceEndWaiters(completed: false)
     }
 
     private var bufferedAudioDuration: Duration {
@@ -212,6 +250,7 @@ public actor BoundedDownlinkJitterBuffer {
         sink: any AudioFrameSink,
         onFailure: AudioStreamingFailureHandler?
     ) {
+        resumeSourceEndWaiters(completed: false)
         receiverTask?.cancel()
         receiverTask = nil
         activeGeneration = AudioFlowGeneration(flowID: flowID)
@@ -224,6 +263,8 @@ public actor BoundedDownlinkJitterBuffer {
         isRunning = true
         isDelivering = false
         requiresTargetBuffer = true
+        sourceHasEnded = false
+        isAwaitingRebufferRecovery = false
         droppedOverflowFrameCount = 0
         droppedExpiredFrameCount = 0
         droppedOutOfOrderFrameCount = 0
@@ -238,6 +279,11 @@ public actor BoundedDownlinkJitterBuffer {
         generation: AudioFlowGeneration
     ) {
         guard activeGeneration == generation, isRunning else { return }
+        guard !sourceHasEnded else {
+            discardedFrameCount += 1
+            recordDiscard(frame: frame, reason: .stopped)
+            return
+        }
         guard frame.flowID == generation.flowID else {
             discardedFrameCount += 1
             recordDiscard(frame: frame, reason: .staleFlow)
@@ -275,6 +321,14 @@ public actor BoundedDownlinkJitterBuffer {
         }
 
         let pending = PendingFrame(frame: frame, receivedAt: currentTime)
+        if isAwaitingRebufferRecovery {
+            isAwaitingRebufferRecovery = false
+            rebufferCount += 1
+            record(.rebuffered(
+                flowID: generation.flowID,
+                bufferedDuration: .zero
+            ))
+        }
         if let index = pendingFrames.firstIndex(where: {
             $0.frame.sequence > frame.sequence
         }) {
@@ -345,12 +399,12 @@ public actor BoundedDownlinkJitterBuffer {
 
         discardExpiredFrames(at: clock.now())
         if pendingFrames.isEmpty {
+            if sourceHasEnded {
+                completeSourceEnd(generation: generation)
+                return
+            }
             requiresTargetBuffer = true
-            rebufferCount += 1
-            record(.rebuffered(
-                flowID: generation.flowID,
-                bufferedDuration: .zero
-            ))
+            isAwaitingRebufferRecovery = true
             return
         }
         drainIfReady()
@@ -371,7 +425,10 @@ public actor BoundedDownlinkJitterBuffer {
         sink = nil
         failureHandler = nil
         inFlightAudioDuration = .zero
+        sourceHasEnded = false
+        isAwaitingRebufferRecovery = false
         discardPending(reason: .endpointFailure)
+        resumeSourceEndWaiters(completed: false)
         if let handler {
             Task { await handler(error) }
         }
@@ -380,6 +437,40 @@ public actor BoundedDownlinkJitterBuffer {
     private func receiverFinished(generation: AudioFlowGeneration) {
         guard activeGeneration == generation else { return }
         receiverTask = nil
+        markSourceEnded(generation: generation)
+    }
+
+    private func markSourceEnded(generation: AudioFlowGeneration) {
+        guard activeGeneration == generation, isRunning else { return }
+        sourceHasEnded = true
+        requiresTargetBuffer = false
+        isAwaitingRebufferRecovery = false
+        drainIfReady()
+        if !isDelivering, pendingFrames.isEmpty {
+            completeSourceEnd(generation: generation)
+        }
+    }
+
+    private func completeSourceEnd(generation: AudioFlowGeneration) {
+        guard activeGeneration == generation, isRunning else { return }
+        activeGeneration = nil
+        isRunning = false
+        isDelivering = false
+        requiresTargetBuffer = true
+        sourceHasEnded = false
+        isAwaitingRebufferRecovery = false
+        sink = nil
+        failureHandler = nil
+        inFlightAudioDuration = .zero
+        resumeSourceEndWaiters(completed: true)
+    }
+
+    private func resumeSourceEndWaiters(completed: Bool) {
+        let waiters = sourceEndWaiters
+        sourceEndWaiters.removeAll(keepingCapacity: true)
+        for waiter in waiters {
+            waiter.resume(returning: completed)
+        }
     }
 
     private func discardExpiredFrames(at currentTime: Duration) {

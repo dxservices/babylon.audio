@@ -22,6 +22,12 @@ All notable changes to this project will be documented in this file.
 - Add a bounded downlink jitter buffer with receiver integration, sequence
   ordering, target prebuffering, rebuffering, pending-plus-in-flight accounting,
   and data-consumed sink scheduling semantics.
+- Add the first pipeline-session downlink slice with explicit flow events,
+  endpoint-failure shutdown, end-of-source tail draining below the prebuffer
+  target, and recovery-based rebuffer accounting that excludes normal endings.
+- Route receiver and sink failures through one downlink endpoint-failure
+  lifecycle, serialize event delivery, and reject flow-identifier reuse within
+  a pipeline-session instance.
 - Add content-free streaming snapshots and diagnostics for queue duration,
   discard counts, latency, overflow, expiry, stale work, and rebuffering.
 - Add caller-owned trusted-output records, route snapshots, and a fail-closed
