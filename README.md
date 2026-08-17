@@ -100,6 +100,11 @@ start-time errors. Later A5 slices add their processor and format-normalization
 paths and wire microphone and private-device policies through the route
 controller and shared device engine.
 
+The deterministic session suite also composes local monitor, uplink, and
+downlink in one configuration. Both source-driven branches observe the same
+flow as the controlled receiver and its flushed tail, and the combined session
+emits only one terminal flow lifecycle.
+
 ## Device and route policy
 
 `AudioRouteSafetyPolicy` evaluates the actual current input and output route.

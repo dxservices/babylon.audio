@@ -4,6 +4,63 @@ import Testing
 
 @Suite("Audio pipeline session")
 struct AudioPipelineSessionTests {
+    @Test("Local monitor, uplink, and downlink share one session flow")
+    func allThreePlansShareOneFlow() async throws {
+        let flowID = AudioFlowID()
+        let sourceFrame = try makeSessionFrame(flowID: flowID, sequence: 0)
+        let downlinkFrame = try makeSessionFrame(flowID: flowID, sequence: 1)
+        let monitor = SessionRecordingSink()
+        let sender = SessionRecordingSender()
+        let receiver = SessionControlledReceiver()
+        let downlinkSink = SessionRecordingSink()
+        let events = SessionRecordingEventSink()
+        let configuration = try AudioPipelineConfiguration(
+            source: .externalFrames,
+            localMonitorSink: .external(monitor),
+            uplinkSender: sender,
+            downlinkReceiver: receiver,
+            downlinkSink: .external(downlinkSink),
+            eventSink: events
+        )
+        let session = AudioPipelineSession(
+            configuration: configuration,
+            downlinkPolicy: try BoundedDownlinkJitterBufferPolicy(
+                targetBufferedAudioDuration: .milliseconds(200),
+                maximumBufferedAudioDuration: .seconds(1),
+                maximumFrameAge: .seconds(2)
+            )
+        )
+
+        try await session.start(flowID: flowID)
+        #expect(await eventuallySession { receiver.isReady() })
+        try await session.submit(sourceFrame)
+        #expect(await eventuallySession {
+            await monitor.values() == [sourceFrame]
+                && sender.values() == [sourceFrame]
+        })
+
+        receiver.yield(downlinkFrame)
+        receiver.finish()
+
+        #expect(await eventuallySession {
+            let receivedFrames = await downlinkSink.values()
+            let receivedEvents = await events.values()
+            return receivedFrames == [downlinkFrame]
+                && receivedEvents == [
+                    .flowStarted(flowID: flowID),
+                    .sourceEnded(flowID: flowID),
+                    .flowStopped(flowID: flowID, reason: .sourceEnded),
+                ]
+        })
+        #expect(await session.snapshot.state == .stopped)
+        #expect(!(await session.uplinkSnapshot.isRunning))
+        await #expect(throws: AudioPipelineSessionError.notRunning) {
+            try await session.submit(sourceFrame)
+        }
+        for _ in 0..<10 { await Task.yield() }
+        #expect(await events.values().count == 3)
+    }
+
     @Test("External frames share one flow across local monitor and bounded uplink")
     func externalFramesFanOutAcrossSourcePlans() async throws {
         let flowID = AudioFlowID()
@@ -445,6 +502,47 @@ private struct SessionOpenReceiver: AudioFrameReceiver {
             for frame in framesToYield where frame.flowID == flowID {
                 continuation.yield(frame)
             }
+        }
+    }
+}
+
+private final class SessionControlledReceiver: AudioFrameReceiver, @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation:
+        AsyncThrowingStream<AudioFrame, any Error>.Continuation?
+
+    func frames(
+        for flowID: AudioFlowID
+    ) -> AsyncThrowingStream<AudioFrame, any Error> {
+        AsyncThrowingStream { continuation in
+            lock.withLock {
+                self.continuation = continuation
+            }
+            continuation.onTermination = { [weak self] _ in
+                self?.clearContinuation()
+            }
+        }
+    }
+
+    func isReady() -> Bool {
+        lock.withLock { continuation != nil }
+    }
+
+    func yield(_ frame: AudioFrame) {
+        let current: AsyncThrowingStream<AudioFrame, any Error>.Continuation? =
+            lock.withLock { self.continuation }
+        current?.yield(frame)
+    }
+
+    func finish() {
+        let current: AsyncThrowingStream<AudioFrame, any Error>.Continuation? =
+            lock.withLock { self.continuation }
+        current?.finish()
+    }
+
+    private func clearContinuation() {
+        lock.withLock {
+            continuation = nil
         }
     }
 }

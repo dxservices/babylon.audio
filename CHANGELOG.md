@@ -32,6 +32,8 @@ All notable changes to this project will be documented in this file.
   bounded uplink sender, with serialized submission, flow isolation, snapshots,
   cancellation-aware admission, and atomic local-monitor or uplink failure
   shutdown.
+- Verify local monitor, uplink, and downlink composition under one pipeline
+  session, flow identifier, and terminal lifecycle.
 - Add content-free streaming snapshots and diagnostics for queue duration,
   discard counts, latency, overflow, expiry, stale work, and rebuffering.
 - Add caller-owned trusted-output records, route snapshots, and a fail-closed
