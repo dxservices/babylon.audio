@@ -85,10 +85,20 @@ that method may be waiting for the current event delivery to finish. Each flow
 identifier is single-use within one session instance, so a late completion can
 never match a later generation that happens to reuse the same identifier.
 
-This first slice intentionally rejects source-driven plans and device sinks at
-start. Later A5 slices add the shared local-monitor/uplink source path and wire
-microphone and private-device policies through the route controller and shared
-device engine.
+Caller-driven `.externalFrames` can now fan each accepted frame into an external
+local-monitor sink and a format-aware bounded uplink queue under the same flow
+generation. Submission is serial, rejects frames from another flow, and records
+the current source format in the pipeline snapshot. A submission cancelled
+while waiting for serialization releases its FIFO position without reaching
+either endpoint. Uplink sender and local-
+monitor sink failures atomically claim flow termination before serialized
+`endpointFailed` and `flowStopped(.endpointFailure)` delivery, so concurrent
+caller stop cannot rewrite the terminal reason.
+
+External `AudioFrameSource`, microphone, and device-sink plans remain explicit
+start-time errors. Later A5 slices add their processor and format-normalization
+paths and wire microphone and private-device policies through the route
+controller and shared device engine.
 
 ## Device and route policy
 

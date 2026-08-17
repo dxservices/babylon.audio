@@ -2,6 +2,9 @@
 public enum AudioPipelineSessionError: Error, Equatable, Sendable {
     case alreadyRunning
     case reusedFlowID
+    case notRunning
+    case externalFramesNotConfigured
+    case frameFlowMismatch
     case sourceDrivenPlanNotAvailable
     case deviceRuntimeRequired
 }
@@ -9,19 +12,28 @@ public enum AudioPipelineSessionError: Error, Equatable, Sendable {
 @available(iOS 18, macOS 13, *)
 public actor AudioPipelineSession {
     private let configuration: AudioPipelineConfiguration
+    private let uplink: BoundedUplinkQueue
     private let downlink: BoundedDownlinkJitterBuffer
-    private let eventGate = AudioPipelineEventGate()
+    private let eventGate = AudioPipelineSerialGate()
+    private let sourceGate = AudioPipelineSerialGate()
 
     private var activeGeneration: AudioFlowGeneration?
     private var receiverTask: Task<Void, Never>?
     private var state: AudioPipelineState = .idle
     private var usedFlowIDs: Set<AudioFlowID> = []
+    private var activeLocalMonitorSink: (any AudioFrameSink)?
+    private var sourceFormat: AudioStreamFormat?
 
     public init(
         configuration: AudioPipelineConfiguration,
+        uplinkPolicy: BoundedUplinkQueuePolicy = .initial,
         downlinkPolicy: BoundedDownlinkJitterBufferPolicy = .initial
     ) {
         self.configuration = configuration
+        uplink = BoundedUplinkQueue(
+            policy: uplinkPolicy,
+            diagnosticSink: configuration.diagnosticSink
+        )
         downlink = BoundedDownlinkJitterBuffer(
             policy: downlinkPolicy,
             diagnosticSink: configuration.diagnosticSink
@@ -30,15 +42,23 @@ public actor AudioPipelineSession {
 
     public var snapshot: AudioPipelineSnapshot {
         get async {
+            let uplinkSnapshot = await uplink.snapshot
             let downlinkSnapshot = await downlink.snapshot
             return AudioPipelineSnapshot(
                 flowID: activeGeneration?.flowID,
                 state: state,
-                sourceFormat: nil,
-                uplink: .zero,
+                sourceFormat: sourceFormat,
+                uplink: uplinkSnapshot.pending,
                 downlink: downlinkSnapshot.pending,
-                discardedFrameCount: downlinkSnapshot.discardedFrameCount
+                discardedFrameCount: uplinkSnapshot.discardedFrameCount
+                    &+ downlinkSnapshot.discardedFrameCount
             )
+        }
+    }
+
+    public var uplinkSnapshot: BoundedUplinkQueueSnapshot {
+        get async {
+            await uplink.snapshot
         }
     }
 
@@ -55,35 +75,66 @@ public actor AudioPipelineSession {
         guard !usedFlowIDs.contains(flowID) else {
             throw AudioPipelineSessionError.reusedFlowID
         }
-        guard configuration.source == nil,
-              configuration.localMonitorSink == nil,
-              configuration.uplinkSender == nil
-        else {
-            throw AudioPipelineSessionError.sourceDrivenPlanNotAvailable
+        if let source = configuration.source {
+            guard case .externalFrames = source else {
+                throw AudioPipelineSessionError.sourceDrivenPlanNotAvailable
+            }
         }
-        guard let receiver = configuration.downlinkReceiver,
-              let sinkConfiguration = configuration.downlinkSink
-        else {
-            preconditionFailure("AudioPipelineConfiguration guarantees a complete downlink")
-        }
-        guard case .external(let sink) = sinkConfiguration else {
+
+        let localMonitorSink: (any AudioFrameSink)?
+        switch configuration.localMonitorSink {
+        case .external(let sink):
+            localMonitorSink = sink
+        case .device:
             throw AudioPipelineSessionError.deviceRuntimeRequired
+        case nil:
+            localMonitorSink = nil
+        }
+
+        let downlinkSink: (any AudioFrameSink)?
+        switch configuration.downlinkSink {
+        case .external(let sink):
+            downlinkSink = sink
+        case .device:
+            throw AudioPipelineSessionError.deviceRuntimeRequired
+        case nil:
+            downlinkSink = nil
         }
 
         let generation = AudioFlowGeneration(flowID: flowID)
         usedFlowIDs.insert(flowID)
         activeGeneration = generation
         state = .running
-        await downlink.start(
-            flowID: flowID,
-            sink: sink,
-            onFailure: { [weak self] _ in
-                await self?.downlinkFailed(generation: generation)
-            }
-        )
+        activeLocalMonitorSink = localMonitorSink
+        sourceFormat = nil
+        if let sender = configuration.uplinkSender {
+            await uplink.start(
+                flowID: flowID,
+                sender: sender,
+                onFailure: { [weak self] _ in
+                    await self?.planFailed(
+                        direction: .uplink,
+                        generation: generation
+                    )
+                }
+            )
+        }
+        if let downlinkSink {
+            await downlink.start(
+                flowID: flowID,
+                sink: downlinkSink,
+                onFailure: { [weak self] _ in
+                    await self?.planFailed(
+                        direction: .downlink,
+                        generation: generation
+                    )
+                }
+            )
+        }
         await emit(.flowStarted(flowID: flowID))
         guard activeGeneration == generation else { return }
 
+        guard let receiver = configuration.downlinkReceiver else { return }
         receiverTask = Task { [weak self] in
             do {
                 for try await frame in receiver.frames(for: flowID) {
@@ -96,6 +147,48 @@ public actor AudioPipelineSession {
             } catch {
                 await self?.receiverFailed(error, generation: generation)
             }
+        }
+    }
+
+    public func submit(_ frame: AudioFrame) async throws {
+        await sourceGate.acquire()
+        do {
+            try Task.checkCancellation()
+        } catch {
+            await sourceGate.release()
+            throw error
+        }
+        guard let generation = activeGeneration else {
+            await sourceGate.release()
+            throw AudioPipelineSessionError.notRunning
+        }
+        guard case .externalFrames = configuration.source else {
+            await sourceGate.release()
+            throw AudioPipelineSessionError.externalFramesNotConfigured
+        }
+        guard frame.flowID == generation.flowID else {
+            await sourceGate.release()
+            throw AudioPipelineSessionError.frameFlowMismatch
+        }
+
+        sourceFormat = frame.format
+        if configuration.uplinkSender != nil {
+            await uplink.enqueue(frame)
+        }
+        guard let localMonitorSink = activeLocalMonitorSink else {
+            await sourceGate.release()
+            return
+        }
+        do {
+            try await localMonitorSink.consume(frame)
+            await sourceGate.release()
+        } catch {
+            await sourceGate.release()
+            await planFailed(
+                direction: .localMonitor,
+                generation: generation
+            )
+            throw error
         }
     }
 
@@ -139,25 +232,23 @@ public actor AudioPipelineSession {
         await downlink.failSource(flowID: generation.flowID, error: error)
     }
 
-    private func downlinkFailed(generation: AudioFlowGeneration) async {
-        guard activeGeneration == generation else { return }
-        receiverTask?.cancel()
-        receiverTask = nil
-        await emit(
-            .endpointFailed(flowID: generation.flowID, direction: .downlink)
-        )
-        guard activeGeneration == generation else { return }
+    private func planFailed(
+        direction: AudioDirection,
+        generation: AudioFlowGeneration
+    ) async {
         await finish(
             generation: generation,
             reason: .endpointFailure,
-            stopDownlink: true
+            stopDownlink: true,
+            endpointDirection: direction
         )
     }
 
     private func finish(
         generation: AudioFlowGeneration,
         reason: AudioFlowStopReason,
-        stopDownlink: Bool
+        stopDownlink: Bool,
+        endpointDirection: AudioDirection? = nil
     ) async {
         guard activeGeneration == generation else { return }
         activeGeneration = nil
@@ -165,8 +256,16 @@ public actor AudioPipelineSession {
         let task = receiverTask
         receiverTask = nil
         task?.cancel()
+        activeLocalMonitorSink = nil
+        await uplink.stop()
         if stopDownlink {
             await downlink.stop()
+        }
+        if let endpointDirection {
+            await emit(.endpointFailed(
+                flowID: generation.flowID,
+                direction: endpointDirection
+            ))
         }
         await emit(
             .flowStopped(flowID: generation.flowID, reason: reason)
@@ -182,7 +281,7 @@ public actor AudioPipelineSession {
 }
 
 @available(iOS 18, macOS 13, *)
-private actor AudioPipelineEventGate {
+private actor AudioPipelineSerialGate {
     private var isAcquired = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
 

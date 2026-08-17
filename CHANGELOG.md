@@ -28,6 +28,10 @@ All notable changes to this project will be documented in this file.
 - Route receiver and sink failures through one downlink endpoint-failure
   lifecycle, serialize event delivery, and reject flow-identifier reuse within
   a pipeline-session instance.
+- Add caller-driven external-frame fan-out to an external local monitor and
+  bounded uplink sender, with serialized submission, flow isolation, snapshots,
+  cancellation-aware admission, and atomic local-monitor or uplink failure
+  shutdown.
 - Add content-free streaming snapshots and diagnostics for queue duration,
   discard counts, latency, overflow, expiry, stale work, and rebuffering.
 - Add caller-owned trusted-output records, route snapshots, and a fail-closed
