@@ -42,6 +42,10 @@ pending budget is calculated from each validated frame's duration, independent
 of sample rate, channel count, encoding, and byte layout. Overflow keeps the
 newest pending audio, and frame age is measured from a queue-local monotonic
 enqueue instant rather than from the frame's media timestamp.
+Detailed queue snapshots expose the configured maximum frame age and the
+oldest pending frame's current age. Reading a snapshot never runs expiry or
+otherwise mutates the queue. Discard-reason counts are updated synchronously by
+the queue and do not depend on best-effort diagnostic delivery.
 
 `BoundedDownlinkJitterBuffer` can consume an `AudioFrameReceiver` directly or
 accept frames through `enqueue`. It reorders pending frames by sequence during
@@ -49,6 +53,10 @@ prebuffering, bounds pending plus in-flight audio, and requires the target
 duration again after starvation. Duplicate or already-delivered sequences are
 discarded. A sink's `consume` operation must complete at the data-consumed
 scheduling boundary, not after audible playback completes.
+
+Queue latency is the local wait from enqueue/receive until immediately before
+the package calls the sender or sink. It is not capture-to-network latency,
+receive-to-play latency, or proof that audio became audible.
 
 `finishSource(flowID:)` is the explicit end-of-stream boundary. It bypasses the
 normal prebuffer target for the accepted tail and returns only after that tail
@@ -77,6 +85,14 @@ the jitter buffer's failure handler. Both receiver and sink failures discard
 pending audio with the `endpointFailure` reason. Caller stop invalidates the
 generation and prevents a late tail completion from producing another stop
 event.
+
+`snapshot(for:)` returns an exact-flow `AudioPipelineFlowSnapshot` for the
+active flow or the one most recently completed flow. Active sampling validates
+the flow generation after reading both queue actors. A terminal snapshot is
+frozen only after device, queue, and processor cleanup, before the existing
+directional endpoint event and `flowStopped` FIFO delivery. Endpoint status is
+reported separately for source, local monitor, uplink, and downlink. Snapshots
+contain no PCM, transcripts, credentials, or provider payloads.
 
 Session events are serialized through completion even when lifecycle methods
 overlap. Public `stop()` is a completion barrier: it waits for an already-owned

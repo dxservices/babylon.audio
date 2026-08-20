@@ -115,6 +115,38 @@ struct BoundedDownlinkJitterBufferTests {
         #expect(await buffer.snapshot.pending == .zero)
     }
 
+    @Test("Snapshot reports frame age without expiring buffered audio")
+    func snapshotAgeReadDoesNotMutateBuffer() async throws {
+        let time = MutableDownlinkTime()
+        let flowID = AudioFlowID()
+        let sink = ControlledDownlinkSink()
+        let policy = try BoundedDownlinkJitterBufferPolicy(
+            targetBufferedAudioDuration: .milliseconds(40),
+            maximumBufferedAudioDuration: .seconds(1),
+            maximumFrameAge: .seconds(1)
+        )
+        let buffer = BoundedDownlinkJitterBuffer(
+            policy: policy,
+            clock: AudioMonotonicClock(now: { time.now() })
+        )
+        await buffer.start(flowID: flowID, sink: sink)
+        await buffer.enqueue(try makeDownlinkFrame(
+            flowID: flowID,
+            sequence: 0
+        ))
+        time.advance(by: .milliseconds(1_100))
+
+        let firstRead = await buffer.snapshot
+        let secondRead = await buffer.snapshot
+        #expect(firstRead.maximumFrameAge == policy.maximumFrameAge)
+        #expect(firstRead.oldestPendingFrameAge == .milliseconds(1_100))
+        #expect(firstRead.pending.frameCount == 1)
+        #expect(secondRead.pending.frameCount == 1)
+        #expect(secondRead.discardReasonCounts.expired == 0)
+
+        await buffer.stop()
+    }
+
     @Test("Starvation requires the target duration again before delivery resumes")
     func rebuffersAfterStarvation() async throws {
         let flowID = AudioFlowID()
@@ -201,7 +233,45 @@ struct BoundedDownlinkJitterBufferTests {
         #expect(await sink.consumedSequences() == [0])
         #expect(!(await buffer.snapshot.isRunning))
         #expect(await buffer.snapshot.pending == .zero)
-        #expect(await buffer.snapshot.discardedFrameCount == 1)
+        let snapshot = await buffer.snapshot
+        #expect(snapshot.discardedFrameCount == 1)
+        #expect(snapshot.discardReasonCounts.stopped == 1)
+        #expect(snapshot.discardReasonCounts.total == 1)
+        #expect(snapshot.discardReasonCounts.total
+            == snapshot.discardedFrameCount)
+    }
+
+    @Test("A new generation resets source-end and discard observations")
+    func newGenerationResetsTerminalObservations() async throws {
+        let firstFlowID = AudioFlowID()
+        let secondFlowID = AudioFlowID()
+        let sink = ControlledDownlinkSink()
+        let buffer = BoundedDownlinkJitterBuffer(
+            policy: try BoundedDownlinkJitterBufferPolicy(
+                targetBufferedAudioDuration: .milliseconds(20),
+                maximumBufferedAudioDuration: .seconds(1),
+                maximumFrameAge: .seconds(2)
+            )
+        )
+        await buffer.start(flowID: firstFlowID, sink: sink)
+        await buffer.enqueue(try makeDownlinkFrame(
+            flowID: firstFlowID,
+            sequence: 0,
+            duration: .seconds(2)
+        ))
+        #expect(await buffer.snapshot.discardReasonCounts.overflow == 1)
+        #expect(await buffer.finishSource(flowID: firstFlowID))
+        let terminal = await buffer.snapshot
+        #expect(terminal.sourceEnded)
+        #expect(!terminal.isRunning)
+
+        await buffer.start(flowID: secondFlowID, sink: sink)
+        let replacement = await buffer.snapshot
+        #expect(replacement.flowID == secondFlowID)
+        #expect(replacement.isRunning)
+        #expect(!replacement.sourceEnded)
+        #expect(replacement.discardReasonCounts.total == 0)
+        #expect(replacement.discardedFrameCount == 0)
     }
 
     @Test("Frames enqueued while stopped count as discarded")
@@ -219,7 +289,12 @@ struct BoundedDownlinkJitterBufferTests {
             sequence: 0
         ))
 
-        #expect(await buffer.snapshot.discardedFrameCount == 1)
+        let snapshot = await buffer.snapshot
+        #expect(snapshot.discardedFrameCount == 1)
+        #expect(snapshot.discardReasonCounts.stopped == 1)
+        #expect(snapshot.discardReasonCounts.total == 1)
+        #expect(snapshot.discardReasonCounts.total
+            == snapshot.discardedFrameCount)
     }
 
     @Test("Duplicate and already-delivered sequences are discarded")

@@ -620,6 +620,10 @@ struct AudioPipelineSessionTests {
             try await submission.value
         }
         #expect(backend.playbackSequences.isEmpty)
+        let terminal = try #require(await session.snapshot(for: flowID))
+        #expect(terminal.lifecycle == .terminal(.endpointFailure))
+        #expect(terminal.endpoints.uplink == .failed)
+        #expect(terminal.endpoints.localMonitor == .stopped)
     }
 
     @Test("The first naturally ended endpoint owns shared-flow termination")
@@ -1202,6 +1206,12 @@ struct AudioPipelineSessionTests {
             .flowStarted(flowID: replacementFlowID),
             .flowStopped(flowID: replacementFlowID, reason: .safetyBoundary),
         ])
+        let safetySnapshot = try #require(
+            await replacementSession.snapshot(for: replacementFlowID)
+        )
+        #expect(safetySnapshot.lifecycle == .terminal(.safetyBoundary))
+        #expect(safetySnapshot.endpoints.source == .stopped)
+        #expect(safetySnapshot.endpoints.uplink == .stopped)
     }
 
     @Test("Safety claim racing replacement stays paired with old session and fails replacement closed")
@@ -1869,6 +1879,105 @@ struct AudioPipelineSessionTests {
         await #expect(throws: AudioPipelineSessionError.reusedFlowID) {
             try await session.start(flowID: flowID)
         }
+    }
+
+    @Test("Exact-flow snapshot is frozen before terminal event delivery")
+    func terminalSnapshotPrecedesFlowStoppedDelivery() async throws {
+        let flowID = AudioFlowID()
+        let events = SessionSnapshotEventSink()
+        let configuration = try AudioPipelineConfiguration(
+            source: .externalFrames,
+            uplinkSender: SessionRecordingSender(),
+            eventSink: events
+        )
+        let session = AudioPipelineSession(configuration: configuration)
+        await events.attach(session)
+
+        try await session.start(flowID: flowID)
+        let active = try #require(await session.snapshot(for: flowID))
+        #expect(active.lifecycle == .active)
+        #expect(active.endpoints.source == .active)
+        #expect(active.endpoints.uplink == .active)
+        #expect(active.endpoints.downlink == .notConfigured)
+
+        await session.stop()
+
+        let delivered = try #require(await events.terminalSnapshot())
+        #expect(delivered.flowID == flowID)
+        #expect(delivered.lifecycle == .terminal(.consumerRequested))
+        #expect(delivered.endpoints.source == .stopped)
+        #expect(delivered.endpoints.uplink == .stopped)
+        #expect(delivered.uplink.pending == .zero)
+        #expect(await events.values() == [
+            .flowStarted(flowID: flowID),
+            .flowStopped(flowID: flowID, reason: .consumerRequested),
+        ])
+    }
+
+    @Test("Only the active and most recent terminal flow are retained")
+    func exactFlowSnapshotRetentionIsBounded() async throws {
+        let first = AudioFlowID()
+        let second = AudioFlowID()
+        let session = AudioPipelineSession(configuration:
+            try AudioPipelineConfiguration(
+                source: .externalFrames,
+                uplinkSender: SessionRecordingSender()
+            )
+        )
+
+        try await session.start(flowID: first)
+        await session.stop()
+        try await session.start(flowID: second)
+        #expect(await session.snapshot(for: first) != nil)
+        #expect(await session.snapshot(for: second)?.lifecycle == .active)
+        await session.stop()
+
+        #expect(await session.snapshot(for: first) == nil)
+        #expect(await session.snapshot(for: second)?.lifecycle
+            == .terminal(.consumerRequested))
+    }
+
+    @Test("Natural downlink end is represented by direction")
+    func naturalEndSnapshotPreservesDownlinkSourceEnd() async throws {
+        let flowID = AudioFlowID()
+        let session = AudioPipelineSession(configuration:
+            try AudioPipelineConfiguration(
+                downlinkReceiver: SessionFixedReceiver(frames: []),
+                downlinkSink: .external(SessionRecordingSink())
+            )
+        )
+
+        try await session.start(flowID: flowID)
+        #expect(await eventuallySession {
+            await session.snapshot(for: flowID)?.lifecycle
+                == .terminal(.sourceEnded)
+        })
+        let snapshot = try #require(await session.snapshot(for: flowID))
+        #expect(snapshot.endpoints.downlink == .naturallyEnded)
+        #expect(snapshot.endpoints.source == .notConfigured)
+        #expect(snapshot.downlink.sourceEnded)
+    }
+}
+
+private actor SessionSnapshotEventSink: AudioEventSink {
+    private weak var session: AudioPipelineSession?
+    private var events: [AudioEvent] = []
+    private var capturedTerminalSnapshot: AudioPipelineFlowSnapshot?
+
+    func attach(_ session: AudioPipelineSession) {
+        self.session = session
+    }
+
+    func receive(_ event: AudioEvent) async {
+        events.append(event)
+        guard case .flowStopped(let flowID, _) = event else { return }
+        capturedTerminalSnapshot = await session?.snapshot(for: flowID)
+    }
+
+    func values() -> [AudioEvent] { events }
+
+    func terminalSnapshot() -> AudioPipelineFlowSnapshot? {
+        capturedTerminalSnapshot
     }
 }
 

@@ -51,7 +51,7 @@ public enum AudioDirection: Equatable, Sendable {
     case downlink
 }
 
-public enum AudioDiscardReason: Equatable, Sendable {
+public enum AudioDiscardReason: Equatable, Hashable, Sendable {
     case overflow
     case expired
     case staleFlow
@@ -60,6 +60,56 @@ public enum AudioDiscardReason: Equatable, Sendable {
     case stopped
     case endpointFailure
     case processingFailure
+}
+
+/// Content-free cumulative discard counts for one queue generation.
+public struct AudioDiscardReasonCounts: Equatable, Sendable {
+    public private(set) var overflow: UInt64
+    public private(set) var expired: UInt64
+    public private(set) var staleFlow: UInt64
+    public private(set) var outOfOrder: UInt64
+    public private(set) var sourceEnded: UInt64
+    public private(set) var stopped: UInt64
+    public private(set) var endpointFailure: UInt64
+    public private(set) var processingFailure: UInt64
+
+    public init(
+        overflow: UInt64 = 0,
+        expired: UInt64 = 0,
+        staleFlow: UInt64 = 0,
+        outOfOrder: UInt64 = 0,
+        sourceEnded: UInt64 = 0,
+        stopped: UInt64 = 0,
+        endpointFailure: UInt64 = 0,
+        processingFailure: UInt64 = 0
+    ) {
+        self.overflow = overflow
+        self.expired = expired
+        self.staleFlow = staleFlow
+        self.outOfOrder = outOfOrder
+        self.sourceEnded = sourceEnded
+        self.stopped = stopped
+        self.endpointFailure = endpointFailure
+        self.processingFailure = processingFailure
+    }
+
+    public var total: UInt64 {
+        overflow &+ expired &+ staleFlow &+ outOfOrder &+ sourceEnded
+            &+ stopped &+ endpointFailure &+ processingFailure
+    }
+
+    mutating func record(_ reason: AudioDiscardReason, count: UInt64 = 1) {
+        switch reason {
+        case .overflow: overflow &+= count
+        case .expired: expired &+= count
+        case .staleFlow: staleFlow &+= count
+        case .outOfOrder: outOfOrder &+= count
+        case .sourceEnded: sourceEnded &+= count
+        case .stopped: stopped &+= count
+        case .endpointFailure: endpointFailure &+= count
+        case .processingFailure: processingFailure &+= count
+        }
+    }
 }
 
 @available(iOS 18, macOS 13, *)
@@ -132,5 +182,75 @@ public struct AudioPipelineSnapshot: Equatable, Sendable {
         self.uplink = uplink
         self.downlink = downlink
         self.discardedFrameCount = discardedFrameCount
+    }
+}
+
+public enum AudioEndpointStatus: Equatable, Sendable {
+    case notConfigured
+    case starting
+    case active
+    case naturallyEnded
+    case failed
+    case stopped
+}
+
+public struct AudioEndpointStates: Equatable, Sendable {
+    public let source: AudioEndpointStatus
+    public let localMonitor: AudioEndpointStatus
+    public let uplink: AudioEndpointStatus
+    public let downlink: AudioEndpointStatus
+
+    public init(
+        source: AudioEndpointStatus,
+        localMonitor: AudioEndpointStatus,
+        uplink: AudioEndpointStatus,
+        downlink: AudioEndpointStatus
+    ) {
+        self.source = source
+        self.localMonitor = localMonitor
+        self.uplink = uplink
+        self.downlink = downlink
+    }
+
+    public subscript(direction: AudioDirection) -> AudioEndpointStatus {
+        switch direction {
+        case .source: source
+        case .localMonitor: localMonitor
+        case .uplink: uplink
+        case .downlink: downlink
+        }
+    }
+}
+
+public enum AudioPipelineFlowLifecycle: Equatable, Sendable {
+    case active
+    case terminal(AudioFlowStopReason)
+}
+
+/// An exact-flow, content-free observation. A session retains its active flow
+/// and at most its most recently completed flow.
+@available(iOS 18, macOS 13, *)
+public struct AudioPipelineFlowSnapshot: Equatable, Sendable {
+    public let flowID: AudioFlowID
+    public let lifecycle: AudioPipelineFlowLifecycle
+    public let sourceFormat: AudioStreamFormat?
+    public let endpoints: AudioEndpointStates
+    public let uplink: BoundedUplinkQueueSnapshot
+    public let downlink: BoundedDownlinkJitterBufferSnapshot
+
+    public init(
+        flowID: AudioFlowID,
+        lifecycle: AudioPipelineFlowLifecycle,
+        sourceFormat: AudioStreamFormat?,
+        endpoints: AudioEndpointStates,
+        uplink: BoundedUplinkQueueSnapshot,
+        downlink: BoundedDownlinkJitterBufferSnapshot
+    ) {
+        self.flowID = flowID
+        self.lifecycle = lifecycle
+        self.sourceFormat = sourceFormat
+        self.endpoints = endpoints
+        self.uplink = uplink
+        self.downlink = downlink
     }
 }

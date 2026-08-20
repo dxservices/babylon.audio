@@ -48,43 +48,61 @@ public struct BoundedDownlinkJitterBufferSnapshot: Equatable, Sendable {
     public let isRunning: Bool
     public let isBuffering: Bool
     public let isDelivering: Bool
+    public let sourceEnded: Bool
     public let pending: AudioQueueSnapshot
     public let bufferedAudioDuration: Duration
     public let droppedOverflowFrameCount: UInt64
     public let droppedExpiredFrameCount: UInt64
     public let droppedOutOfOrderFrameCount: UInt64
     public let discardedFrameCount: UInt64
+    public let discardReasonCounts: AudioDiscardReasonCounts
     public let rebufferCount: UInt64
     public let maximumBufferedAudioDuration: Duration
+    public let maximumFrameAge: Duration
+    public let oldestPendingFrameAge: Duration?
     public let maximumReceiveToSinkLatency: Duration
+
+    /// Local receive to immediately-before-sink-call wait. Sink completion is
+    /// the data-consumed boundary and does not prove audible playback.
+    public var maximumReceiveToSinkWait: Duration {
+        maximumReceiveToSinkLatency
+    }
 
     public init(
         flowID: AudioFlowID?,
         isRunning: Bool,
         isBuffering: Bool,
         isDelivering: Bool,
+        sourceEnded: Bool = false,
         pending: AudioQueueSnapshot,
         bufferedAudioDuration: Duration,
         droppedOverflowFrameCount: UInt64,
         droppedExpiredFrameCount: UInt64,
         droppedOutOfOrderFrameCount: UInt64,
         discardedFrameCount: UInt64,
+        discardReasonCounts: AudioDiscardReasonCounts = .init(),
         rebufferCount: UInt64,
         maximumBufferedAudioDuration: Duration,
+        maximumFrameAge: Duration = .zero,
+        oldestPendingFrameAge: Duration? = nil,
         maximumReceiveToSinkLatency: Duration
     ) {
         self.flowID = flowID
         self.isRunning = isRunning
         self.isBuffering = isBuffering
         self.isDelivering = isDelivering
+        self.sourceEnded = sourceEnded
         self.pending = pending
         self.bufferedAudioDuration = bufferedAudioDuration
         self.droppedOverflowFrameCount = droppedOverflowFrameCount
         self.droppedExpiredFrameCount = droppedExpiredFrameCount
         self.droppedOutOfOrderFrameCount = droppedOutOfOrderFrameCount
         self.discardedFrameCount = discardedFrameCount
+        self.discardReasonCounts = discardReasonCounts
         self.rebufferCount = rebufferCount
         self.maximumBufferedAudioDuration = maximumBufferedAudioDuration
+        self.maximumFrameAge = maximumFrameAge
+        self.oldestPendingFrameAge = oldestPendingFrameAge
         self.maximumReceiveToSinkLatency = maximumReceiveToSinkLatency
     }
 }
@@ -112,12 +130,14 @@ public actor BoundedDownlinkJitterBuffer {
     private var isDelivering = false
     private var requiresTargetBuffer = true
     private var sourceHasEnded = false
+    private var sourceDidEnd = false
     private var isAwaitingRebufferRecovery = false
     private var sourceEndWaiters: [CheckedContinuation<Bool, Never>] = []
     private var droppedOverflowFrameCount: UInt64 = 0
     private var droppedExpiredFrameCount: UInt64 = 0
     private var droppedOutOfOrderFrameCount: UInt64 = 0
     private var discardedFrameCount: UInt64 = 0
+    private var discardReasonCounts = AudioDiscardReasonCounts()
     private var rebufferCount: UInt64 = 0
     private var observedMaximumBufferedAudioDuration: Duration = .zero
     private var maximumReceiveToSinkLatency: Duration = .zero
@@ -133,11 +153,13 @@ public actor BoundedDownlinkJitterBuffer {
     }
 
     public var snapshot: BoundedDownlinkJitterBufferSnapshot {
-        BoundedDownlinkJitterBufferSnapshot(
+        let currentTime = clock.now()
+        return BoundedDownlinkJitterBufferSnapshot(
             flowID: activeGeneration?.flowID,
             isRunning: isRunning,
             isBuffering: isRunning && requiresTargetBuffer,
             isDelivering: isDelivering,
+            sourceEnded: sourceDidEnd,
             pending: AudioQueueSnapshot(
                 frameCount: pendingFrames.count,
                 duration: pendingAudioDuration
@@ -147,8 +169,13 @@ public actor BoundedDownlinkJitterBuffer {
             droppedExpiredFrameCount: droppedExpiredFrameCount,
             droppedOutOfOrderFrameCount: droppedOutOfOrderFrameCount,
             discardedFrameCount: discardedFrameCount,
+            discardReasonCounts: discardReasonCounts,
             rebufferCount: rebufferCount,
             maximumBufferedAudioDuration: observedMaximumBufferedAudioDuration,
+            maximumFrameAge: policy.maximumFrameAge,
+            oldestPendingFrameAge: pendingFrames.map {
+                max(.zero, currentTime - $0.receivedAt)
+            }.max(),
             maximumReceiveToSinkLatency: maximumReceiveToSinkLatency
         )
     }
@@ -187,6 +214,7 @@ public actor BoundedDownlinkJitterBuffer {
     public func enqueue(_ frame: AudioFrame) {
         guard let generation = activeGeneration else {
             discardedFrameCount += 1
+            discardReasonCounts.record(.stopped)
             recordDiscard(frame: frame, reason: .stopped)
             return
         }
@@ -236,6 +264,7 @@ public actor BoundedDownlinkJitterBuffer {
         failureHandler = nil
         inFlightAudioDuration = .zero
         sourceHasEnded = false
+        sourceDidEnd = false
         isAwaitingRebufferRecovery = false
         discardPending(reason: .stopped)
         resumeSourceEndWaiters(completed: false)
@@ -264,11 +293,13 @@ public actor BoundedDownlinkJitterBuffer {
         isDelivering = false
         requiresTargetBuffer = true
         sourceHasEnded = false
+        sourceDidEnd = false
         isAwaitingRebufferRecovery = false
         droppedOverflowFrameCount = 0
         droppedExpiredFrameCount = 0
         droppedOutOfOrderFrameCount = 0
         discardedFrameCount = 0
+        discardReasonCounts = AudioDiscardReasonCounts()
         rebufferCount = 0
         observedMaximumBufferedAudioDuration = .zero
         maximumReceiveToSinkLatency = .zero
@@ -281,11 +312,13 @@ public actor BoundedDownlinkJitterBuffer {
         guard activeGeneration == generation, isRunning else { return }
         guard !sourceHasEnded else {
             discardedFrameCount += 1
-            recordDiscard(frame: frame, reason: .stopped)
+            discardReasonCounts.record(.sourceEnded)
+            recordDiscard(frame: frame, reason: .sourceEnded)
             return
         }
         guard frame.flowID == generation.flowID else {
             discardedFrameCount += 1
+            discardReasonCounts.record(.staleFlow)
             recordDiscard(frame: frame, reason: .staleFlow)
             return
         }
@@ -295,6 +328,7 @@ public actor BoundedDownlinkJitterBuffer {
               })
         else {
             droppedOutOfOrderFrameCount += 1
+            discardReasonCounts.record(.outOfOrder)
             recordDiscard(frame: frame, reason: .outOfOrder)
             return
         }
@@ -303,6 +337,7 @@ public actor BoundedDownlinkJitterBuffer {
         discardExpiredFrames(at: currentTime)
         guard frame.duration <= policy.maximumBufferedAudioDuration else {
             droppedOverflowFrameCount += 1
+            discardReasonCounts.record(.overflow)
             recordDiscard(frame: frame, reason: .overflow)
             return
         }
@@ -316,6 +351,7 @@ public actor BoundedDownlinkJitterBuffer {
             <= policy.maximumBufferedAudioDuration
         else {
             droppedOverflowFrameCount += 1
+            discardReasonCounts.record(.overflow)
             recordDiscard(frame: frame, reason: .overflow)
             return
         }
@@ -443,6 +479,7 @@ public actor BoundedDownlinkJitterBuffer {
     private func markSourceEnded(generation: AudioFlowGeneration) {
         guard activeGeneration == generation, isRunning else { return }
         sourceHasEnded = true
+        sourceDidEnd = true
         requiresTargetBuffer = false
         isAwaitingRebufferRecovery = false
         drainIfReady()
@@ -484,6 +521,7 @@ public actor BoundedDownlinkJitterBuffer {
             let pending = pendingFrames.remove(at: index)
             pendingAudioDuration -= pending.frame.duration
             droppedExpiredFrameCount += 1
+            discardReasonCounts.record(.expired)
             recordDiscard(frame: pending.frame, reason: .expired)
         }
     }
@@ -501,6 +539,7 @@ public actor BoundedDownlinkJitterBuffer {
         default:
             discardedFrameCount += 1
         }
+        discardReasonCounts.record(reason)
         recordDiscard(frame: pending.frame, reason: reason)
     }
 
@@ -512,6 +551,7 @@ public actor BoundedDownlinkJitterBuffer {
         let frames = pendingFrames
         let duration = pendingAudioDuration
         discardedFrameCount += UInt64(frames.count)
+        discardReasonCounts.record(reason, count: UInt64(frames.count))
         pendingFrames.removeAll(keepingCapacity: true)
         pendingAudioDuration = .zero
         record(.queueDiscarded(

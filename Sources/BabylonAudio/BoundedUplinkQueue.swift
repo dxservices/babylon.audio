@@ -47,34 +47,52 @@ public struct BoundedUplinkQueueSnapshot: Equatable, Sendable {
     public let isRunning: Bool
     public let isSending: Bool
     public let isSourceEnded: Bool
+    public let sourceEnded: Bool
     public let pending: AudioQueueSnapshot
     public let droppedOverflowFrameCount: UInt64
     public let droppedExpiredFrameCount: UInt64
     public let discardedFrameCount: UInt64
+    public let discardReasonCounts: AudioDiscardReasonCounts
     public let maximumPendingAudioDuration: Duration
+    public let maximumFrameAge: Duration
+    public let oldestPendingFrameAge: Duration?
     public let maximumEnqueueToSendLatency: Duration
+
+    /// Queue-entry to immediately-before-sender-call wait. This is not a
+    /// network or provider-acceptance latency.
+    public var maximumEnqueueToSenderWait: Duration {
+        maximumEnqueueToSendLatency
+    }
 
     public init(
         flowID: AudioFlowID?,
         isRunning: Bool,
         isSending: Bool,
         isSourceEnded: Bool,
+        sourceEnded: Bool = false,
         pending: AudioQueueSnapshot,
         droppedOverflowFrameCount: UInt64,
         droppedExpiredFrameCount: UInt64,
         discardedFrameCount: UInt64,
+        discardReasonCounts: AudioDiscardReasonCounts = .init(),
         maximumPendingAudioDuration: Duration,
+        maximumFrameAge: Duration = .zero,
+        oldestPendingFrameAge: Duration? = nil,
         maximumEnqueueToSendLatency: Duration
     ) {
         self.flowID = flowID
         self.isRunning = isRunning
         self.isSending = isSending
         self.isSourceEnded = isSourceEnded
+        self.sourceEnded = sourceEnded
         self.pending = pending
         self.droppedOverflowFrameCount = droppedOverflowFrameCount
         self.droppedExpiredFrameCount = droppedExpiredFrameCount
         self.discardedFrameCount = discardedFrameCount
+        self.discardReasonCounts = discardReasonCounts
         self.maximumPendingAudioDuration = maximumPendingAudioDuration
+        self.maximumFrameAge = maximumFrameAge
+        self.oldestPendingFrameAge = oldestPendingFrameAge
         self.maximumEnqueueToSendLatency = maximumEnqueueToSendLatency
     }
 }
@@ -98,10 +116,12 @@ public actor BoundedUplinkQueue {
     private var isRunning = false
     private var isSending = false
     private var sourceHasEnded = false
+    private var sourceDidEnd = false
     private var sourceEndWaiters: [CheckedContinuation<Bool, Never>] = []
     private var droppedOverflowFrameCount: UInt64 = 0
     private var droppedExpiredFrameCount: UInt64 = 0
     private var discardedFrameCount: UInt64 = 0
+    private var discardReasonCounts = AudioDiscardReasonCounts()
     private var observedMaximumPendingAudioDuration: Duration = .zero
     private var maximumEnqueueToSendLatency: Duration = .zero
 
@@ -116,11 +136,13 @@ public actor BoundedUplinkQueue {
     }
 
     public var snapshot: BoundedUplinkQueueSnapshot {
-        BoundedUplinkQueueSnapshot(
+        let currentTime = clock.now()
+        return BoundedUplinkQueueSnapshot(
             flowID: activeGeneration?.flowID,
             isRunning: isRunning,
             isSending: isSending,
             isSourceEnded: sourceHasEnded,
+            sourceEnded: sourceDidEnd,
             pending: AudioQueueSnapshot(
                 frameCount: pendingFrames.count,
                 duration: pendingAudioDuration
@@ -128,7 +150,12 @@ public actor BoundedUplinkQueue {
             droppedOverflowFrameCount: droppedOverflowFrameCount,
             droppedExpiredFrameCount: droppedExpiredFrameCount,
             discardedFrameCount: discardedFrameCount,
+            discardReasonCounts: discardReasonCounts,
             maximumPendingAudioDuration: observedMaximumPendingAudioDuration,
+            maximumFrameAge: policy.maximumFrameAge,
+            oldestPendingFrameAge: pendingFrames.first.map {
+                max(.zero, currentTime - $0.enqueuedAt)
+            },
             maximumEnqueueToSendLatency: maximumEnqueueToSendLatency
         )
     }
@@ -147,9 +174,11 @@ public actor BoundedUplinkQueue {
         isRunning = true
         isSending = false
         sourceHasEnded = false
+        sourceDidEnd = false
         droppedOverflowFrameCount = 0
         droppedExpiredFrameCount = 0
         discardedFrameCount = 0
+        discardReasonCounts = AudioDiscardReasonCounts()
         observedMaximumPendingAudioDuration = .zero
         maximumEnqueueToSendLatency = .zero
     }
@@ -157,16 +186,19 @@ public actor BoundedUplinkQueue {
     public func enqueue(_ frame: AudioFrame) {
         guard isRunning, let generation = activeGeneration else {
             discardedFrameCount += 1
+            discardReasonCounts.record(.stopped)
             recordDiscard(frame: frame, reason: .stopped)
             return
         }
         guard !sourceHasEnded else {
             discardedFrameCount += 1
+            discardReasonCounts.record(.sourceEnded)
             recordDiscard(frame: frame, reason: .sourceEnded)
             return
         }
         guard frame.flowID == generation.flowID else {
             discardedFrameCount += 1
+            discardReasonCounts.record(.staleFlow)
             recordDiscard(frame: frame, reason: .staleFlow)
             return
         }
@@ -175,6 +207,7 @@ public actor BoundedUplinkQueue {
         discardExpiredFrames(at: currentTime)
         guard frame.duration <= policy.maximumPendingAudioDuration else {
             droppedOverflowFrameCount += 1
+            discardReasonCounts.record(.overflow)
             recordDiscard(frame: frame, reason: .overflow)
             return
         }
@@ -189,6 +222,7 @@ public actor BoundedUplinkQueue {
             <= policy.maximumPendingAudioDuration
         else {
             droppedOverflowFrameCount += 1
+            discardReasonCounts.record(.overflow)
             recordDiscard(frame: frame, reason: .overflow)
             return
         }
@@ -301,6 +335,7 @@ public actor BoundedUplinkQueue {
     private func markSourceEnded(generation: AudioFlowGeneration) {
         guard activeGeneration == generation, isRunning else { return }
         sourceHasEnded = true
+        sourceDidEnd = true
         drainIfPossible()
         if !isSending, pendingFrames.isEmpty {
             completeSourceEnd(generation: generation)
@@ -345,6 +380,7 @@ public actor BoundedUplinkQueue {
         default:
             discardedFrameCount += 1
         }
+        discardReasonCounts.record(reason)
         recordDiscard(frame: pending.frame, reason: reason)
     }
 
@@ -356,6 +392,7 @@ public actor BoundedUplinkQueue {
         let frames = pendingFrames
         let duration = pendingAudioDuration
         discardedFrameCount += UInt64(frames.count)
+        discardReasonCounts.record(reason, count: UInt64(frames.count))
         pendingFrames.removeAll(keepingCapacity: true)
         pendingAudioDuration = .zero
         record(.queueDiscarded(

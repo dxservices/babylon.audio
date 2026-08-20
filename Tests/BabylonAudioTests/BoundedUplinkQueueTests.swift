@@ -194,6 +194,37 @@ struct BoundedUplinkQueueTests {
         #expect(await queue.snapshot.pending == .zero)
     }
 
+    @Test("Snapshot reports frame age without expiring pending audio")
+    func snapshotAgeReadDoesNotMutateQueue() async throws {
+        let time = MutableAudioTime()
+        let sender = ControlledUplinkSender()
+        let policy = try BoundedUplinkQueuePolicy(
+            maximumPendingAudioDuration: .seconds(1),
+            maximumFrameAge: .seconds(1)
+        )
+        let queue = BoundedUplinkQueue(
+            policy: policy,
+            clock: AudioMonotonicClock(now: { time.now() })
+        )
+        let flowID = AudioFlowID()
+        await queue.start(flowID: flowID, sender: sender)
+        await queue.enqueue(try makeUplinkFrame(flowID: flowID, sequence: 0))
+        #expect(await eventually { await sender.sentSequences() == [0] })
+        await queue.enqueue(try makeUplinkFrame(flowID: flowID, sequence: 1))
+        time.advance(by: .milliseconds(1_100))
+
+        let firstRead = await queue.snapshot
+        let secondRead = await queue.snapshot
+        #expect(firstRead.maximumFrameAge == policy.maximumFrameAge)
+        #expect(firstRead.oldestPendingFrameAge == .milliseconds(1_100))
+        #expect(firstRead.pending.frameCount == 1)
+        #expect(secondRead.pending.frameCount == 1)
+        #expect(secondRead.discardReasonCounts.expired == 0)
+
+        await queue.stop()
+        await sender.completeNext()
+    }
+
     @Test("Stop clears pending work and late completion cannot restart draining")
     func stopIsolatesLateCompletion() async throws {
         let sender = ControlledUplinkSender()

@@ -66,6 +66,8 @@ public actor AudioPipelineSession {
     private var activePlaybackToken: AudioDevicePlaybackToken?
     private var sourceFormat: AudioStreamFormat?
     private var sourceProcessorChain: AudioFrameProcessorChain?
+    private var activeEndpointStates: AudioEndpointStates
+    private var recentTerminalSnapshot: AudioPipelineFlowSnapshot?
 
     public init(
         configuration: AudioPipelineConfiguration,
@@ -87,6 +89,10 @@ public actor AudioPipelineSession {
             diagnosticSink: configuration.diagnosticSink
         )
         sourceProcessorChain = configuration.sourceProcessorChain
+        activeEndpointStates = Self.endpointStates(
+            for: configuration,
+            configuredStatus: .stopped
+        )
     }
 
     init(
@@ -112,6 +118,10 @@ public actor AudioPipelineSession {
             diagnosticSink: configuration.diagnosticSink
         )
         sourceProcessorChain = configuration.sourceProcessorChain
+        activeEndpointStates = Self.endpointStates(
+            for: configuration,
+            configuredStatus: .stopped
+        )
     }
 
     public var snapshot: AudioPipelineSnapshot {
@@ -140,6 +150,44 @@ public actor AudioPipelineSession {
         get async {
             await downlink.snapshot
         }
+    }
+
+    /// Returns an observation only for the active flow or the most recently
+    /// completed flow. Active sampling validates the flow generation after
+    /// both queue actors have been read so replacement cannot misattribute a
+    /// mixed snapshot.
+    public func snapshot(
+        for flowID: AudioFlowID
+    ) async -> AudioPipelineFlowSnapshot? {
+        if recentTerminalSnapshot?.flowID == flowID,
+           activeGeneration?.flowID != flowID
+        {
+            return recentTerminalSnapshot
+        }
+        guard let generation = activeGeneration,
+              generation.flowID == flowID
+        else {
+            return recentTerminalSnapshot?.flowID == flowID
+                ? recentTerminalSnapshot
+                : nil
+        }
+        let sampledFormat = sourceFormat
+        let sampledEndpoints = activeEndpointStates
+        let uplinkSnapshot = await uplink.snapshot
+        let downlinkSnapshot = await downlink.snapshot
+        guard activeGeneration == generation else {
+            return recentTerminalSnapshot?.flowID == flowID
+                ? recentTerminalSnapshot
+                : nil
+        }
+        return AudioPipelineFlowSnapshot(
+            flowID: flowID,
+            lifecycle: .active,
+            sourceFormat: sampledFormat,
+            endpoints: sampledEndpoints,
+            uplink: uplinkSnapshot,
+            downlink: downlinkSnapshot
+        )
     }
 
     var naturalEndDirections: Set<AudioDirection> {
@@ -264,6 +312,10 @@ public actor AudioPipelineSession {
                 activeLocalMonitorSink = localMonitorSink
                 activePlaybackToken = playbackToken
                 sourceFormat = nil
+                activeEndpointStates = Self.endpointStates(
+                    for: configuration,
+                    configuredStatus: .starting
+                )
             }
         ) else {
             clearPendingStartAttempt(generation: generation)
@@ -307,6 +359,10 @@ public actor AudioPipelineSession {
                 guard activeGeneration == generation else { return }
                 activeFlowHasStarted = true
                 usedFlowIDs.insert(flowID)
+                activeEndpointStates = Self.endpointStates(
+                    for: configuration,
+                    configuredStatus: .active
+                )
             }
         ), activeGeneration == generation, activeFlowHasStarted else {
             if safetyBoundaryLatch.wasInvalidated(since: safetyRevision) {
@@ -602,6 +658,7 @@ public actor AudioPipelineSession {
         }
         sourceTask = nil
         observedNaturalEndDirections.insert(.source)
+        setEndpointStatus(.naturallyEnded, direction: .source)
         guard claimNaturalEnd(
             direction: .source,
             generation: generation
@@ -719,6 +776,7 @@ public actor AudioPipelineSession {
         }
         receiverTask = nil
         observedNaturalEndDirections.insert(.downlink)
+        setEndpointStatus(.naturallyEnded, direction: .downlink)
         guard claimNaturalEnd(
             direction: .downlink,
             generation: generation
@@ -810,6 +868,10 @@ public actor AudioPipelineSession {
             ? nil
             : endpointDirection
         let emitsTerminalEvent = activeFlowHasStarted
+        let terminalEndpointStates = terminalEndpointStates(
+            endpointDirection: finalEndpointDirection
+        )
+        let terminalSourceFormat = sourceFormat
         activeGeneration = nil
         activeSafetyRevision = nil
         activeFlowHasStarted = false
@@ -847,6 +909,17 @@ public actor AudioPipelineSession {
             await downlink.stop()
         }
         sourceProcessorChain?.reset()
+        let finalUplinkSnapshot = await uplink.snapshot
+        let finalDownlinkSnapshot = await downlink.snapshot
+        recentTerminalSnapshot = AudioPipelineFlowSnapshot(
+            flowID: generation.flowID,
+            lifecycle: .terminal(finalReason),
+            sourceFormat: terminalSourceFormat,
+            endpoints: terminalEndpointStates,
+            uplink: finalUplinkSnapshot,
+            downlink: finalDownlinkSnapshot
+        )
+        activeEndpointStates = terminalEndpointStates
         if emitsTerminalEvent, let finalEndpointDirection {
             await emit(.endpointFailed(
                 flowID: generation.flowID,
@@ -899,6 +972,64 @@ public actor AudioPipelineSession {
         }
         deliveryToken.deactivate()
         await eventGate.release()
+    }
+
+    private static func endpointStates(
+        for configuration: AudioPipelineConfiguration,
+        configuredStatus: AudioEndpointStatus
+    ) -> AudioEndpointStates {
+        AudioEndpointStates(
+            source: configuration.source == nil
+                ? .notConfigured : configuredStatus,
+            localMonitor: configuration.localMonitorSink == nil
+                ? .notConfigured : configuredStatus,
+            uplink: configuration.uplinkSender == nil
+                ? .notConfigured : configuredStatus,
+            downlink: configuration.downlinkReceiver == nil
+                ? .notConfigured : configuredStatus
+        )
+    }
+
+    private func setEndpointStatus(
+        _ status: AudioEndpointStatus,
+        direction: AudioDirection
+    ) {
+        activeEndpointStates = AudioEndpointStates(
+            source: direction == .source
+                ? status : activeEndpointStates.source,
+            localMonitor: direction == .localMonitor
+                ? status : activeEndpointStates.localMonitor,
+            uplink: direction == .uplink
+                ? status : activeEndpointStates.uplink,
+            downlink: direction == .downlink
+                ? status : activeEndpointStates.downlink
+        )
+    }
+
+    private func terminalEndpointStates(
+        endpointDirection: AudioDirection?
+    ) -> AudioEndpointStates {
+        func terminal(
+            _ status: AudioEndpointStatus,
+            direction: AudioDirection
+        ) -> AudioEndpointStatus {
+            if status == .notConfigured { return .notConfigured }
+            if status == .naturallyEnded { return .naturallyEnded }
+            if endpointDirection == direction { return .failed }
+            return .stopped
+        }
+        return AudioEndpointStates(
+            source: terminal(activeEndpointStates.source, direction: .source),
+            localMonitor: terminal(
+                activeEndpointStates.localMonitor,
+                direction: .localMonitor
+            ),
+            uplink: terminal(activeEndpointStates.uplink, direction: .uplink),
+            downlink: terminal(
+                activeEndpointStates.downlink,
+                direction: .downlink
+            )
+        )
     }
 }
 

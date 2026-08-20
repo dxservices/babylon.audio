@@ -54,6 +54,11 @@ All notable changes to this project will be documented in this file.
   session, flow identifier, and terminal lifecycle.
 - Add content-free streaming snapshots and diagnostics for queue duration,
   discard counts, latency, overflow, expiry, stale work, and rebuffering.
+- Add exact-flow active and terminal pipeline snapshots with bounded retention,
+  directional endpoint status, synchronous discard-reason counts, configured
+  frame-age policy, non-mutating oldest-pending age, and downlink source-end
+  state. Terminal snapshots freeze after cleanup and before terminal event
+  delivery.
 - Add caller-owned trusted-output records, route snapshots, and a fail-closed
   safety policy for wired, Bluetooth, public, missing, mixed, and multiple
   outputs.
