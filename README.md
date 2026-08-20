@@ -69,9 +69,9 @@ latencies, and discard reasons only.
 
 The initial `AudioPipelineSession` vertical slice owns a downlink receiver task,
 one bounded jitter buffer, an external sink, and their shared flow generation.
-It emits `flowStarted`, then `sourceEnded` when the receiver stream completes,
-drains any sub-target tail, and emits `flowStopped(.sourceEnded)` only after the
-sink has consumed every accepted frame. Receiver failure reports the downlink
+It emits `flowStarted`, then `endpointEnded(.downlink)` when the receiver stream
+completes, drains any eligible sub-target tail under the configured frame-age
+policy, and emits `flowStopped(.sourceEnded)` after that bounded drain. Receiver failure reports the downlink
 endpoint before stopping, and sink failure enters the same lifecycle through
 the jitter buffer's failure handler. Both receiver and sink failures discard
 pending audio with the `endpointFailure` reason. Caller stop invalidates the
@@ -95,10 +95,24 @@ monitor sink failures atomically claim flow termination before serialized
 `endpointFailed` and `flowStopped(.endpointFailure)` delivery, so concurrent
 caller stop cannot rewrite the terminal reason.
 
-External `AudioFrameSource`, microphone, and device-sink plans remain explicit
-start-time errors. Later A5 slices add their processor and format-normalization
-paths and wire microphone and private-device policies through the route
-controller and shared device engine.
+An external `AudioFrameSource` can drive the same serialized local-monitor and
+uplink fan-out without caller submission. Natural source completion emits
+`endpointEnded(.source)`, then drains the eligible accepted tail under the
+bounded queue's capacity and frame-age policies before emitting
+`flowStopped(.sourceEnded)`. Source stream failure reports the content-free
+`.source` endpoint direction and stops the shared flow.
+
+The first naturally ended source or downlink endpoint owns termination of the
+shared flow in v0.1. A source-first ending stops, rather than drains, the
+downlink side. This deliberate half-close policy matches the initial bounded
+half-duplex consumer; a full-duplex consumer requires a separate lifecycle
+decision before adoption. Pipeline endpoint events never carry underlying
+source, receiver, sender, or sink errors. Callers that need private debugging
+detail must observe or map errors inside their injected endpoint boundary.
+Microphone and device-sink plans remain explicit start-time errors. Later A5
+slices add their processor and format-normalization paths and wire microphone
+and private-device policies through the route controller and shared device
+engine.
 
 The deterministic session suite also composes local monitor, uplink, and
 downlink in one configuration. Both source-driven branches observe the same

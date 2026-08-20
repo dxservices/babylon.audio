@@ -10,7 +10,7 @@ public enum AudioFlowStopReason: Equatable, Sendable {
 public enum AudioEvent: Equatable, Sendable {
     case flowStarted(flowID: AudioFlowID)
     case flowStopped(flowID: AudioFlowID, reason: AudioFlowStopReason)
-    case sourceEnded(flowID: AudioFlowID)
+    case endpointEnded(flowID: AudioFlowID, direction: AudioDirection)
     case endpointFailed(flowID: AudioFlowID, direction: AudioDirection)
 }
 
@@ -20,6 +20,7 @@ public protocol AudioEventSink: Sendable {
 }
 
 public enum AudioDirection: Equatable, Sendable {
+    case source
     case localMonitor
     case uplink
     case downlink
@@ -30,6 +31,7 @@ public enum AudioDiscardReason: Equatable, Sendable {
     case expired
     case staleFlow
     case outOfOrder
+    case sourceEnded
     case stopped
     case endpointFailure
     case processingFailure

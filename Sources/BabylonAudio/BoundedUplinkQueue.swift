@@ -46,6 +46,7 @@ public struct BoundedUplinkQueueSnapshot: Equatable, Sendable {
     public let flowID: AudioFlowID?
     public let isRunning: Bool
     public let isSending: Bool
+    public let isSourceEnded: Bool
     public let pending: AudioQueueSnapshot
     public let droppedOverflowFrameCount: UInt64
     public let droppedExpiredFrameCount: UInt64
@@ -57,6 +58,7 @@ public struct BoundedUplinkQueueSnapshot: Equatable, Sendable {
         flowID: AudioFlowID?,
         isRunning: Bool,
         isSending: Bool,
+        isSourceEnded: Bool,
         pending: AudioQueueSnapshot,
         droppedOverflowFrameCount: UInt64,
         droppedExpiredFrameCount: UInt64,
@@ -67,6 +69,7 @@ public struct BoundedUplinkQueueSnapshot: Equatable, Sendable {
         self.flowID = flowID
         self.isRunning = isRunning
         self.isSending = isSending
+        self.isSourceEnded = isSourceEnded
         self.pending = pending
         self.droppedOverflowFrameCount = droppedOverflowFrameCount
         self.droppedExpiredFrameCount = droppedExpiredFrameCount
@@ -94,6 +97,8 @@ public actor BoundedUplinkQueue {
     private var pendingAudioDuration: Duration = .zero
     private var isRunning = false
     private var isSending = false
+    private var sourceHasEnded = false
+    private var sourceEndWaiters: [CheckedContinuation<Bool, Never>] = []
     private var droppedOverflowFrameCount: UInt64 = 0
     private var droppedExpiredFrameCount: UInt64 = 0
     private var discardedFrameCount: UInt64 = 0
@@ -115,6 +120,7 @@ public actor BoundedUplinkQueue {
             flowID: activeGeneration?.flowID,
             isRunning: isRunning,
             isSending: isSending,
+            isSourceEnded: sourceHasEnded,
             pending: AudioQueueSnapshot(
                 frameCount: pendingFrames.count,
                 duration: pendingAudioDuration
@@ -132,6 +138,7 @@ public actor BoundedUplinkQueue {
         sender: any AudioFrameSender,
         onFailure: AudioStreamingFailureHandler? = nil
     ) {
+        resumeSourceEndWaiters(completed: false)
         activeGeneration = AudioFlowGeneration(flowID: flowID)
         pendingFrames.removeAll(keepingCapacity: true)
         pendingAudioDuration = .zero
@@ -139,6 +146,7 @@ public actor BoundedUplinkQueue {
         failureHandler = onFailure
         isRunning = true
         isSending = false
+        sourceHasEnded = false
         droppedOverflowFrameCount = 0
         droppedExpiredFrameCount = 0
         discardedFrameCount = 0
@@ -150,6 +158,11 @@ public actor BoundedUplinkQueue {
         guard isRunning, let generation = activeGeneration else {
             discardedFrameCount += 1
             recordDiscard(frame: frame, reason: .stopped)
+            return
+        }
+        guard !sourceHasEnded else {
+            discardedFrameCount += 1
+            recordDiscard(frame: frame, reason: .sourceEnded)
             return
         }
         guard frame.flowID == generation.flowID else {
@@ -189,6 +202,27 @@ public actor BoundedUplinkQueue {
         drainIfPossible()
     }
 
+    /// Marks the source stream complete and drains the eligible accepted tail.
+    /// Frame-age policy still applies while draining. Returns only after the
+    /// sender accepts that tail, or `false` if stop, replacement, or endpoint
+    /// failure wins the transition.
+    public func finishSource(flowID: AudioFlowID) async -> Bool {
+        guard let generation = activeGeneration,
+              generation.flowID == flowID,
+              isRunning
+        else {
+            return false
+        }
+
+        markSourceEnded(generation: generation)
+        guard activeGeneration == generation, isRunning else {
+            return true
+        }
+        return await withCheckedContinuation { continuation in
+            sourceEndWaiters.append(continuation)
+        }
+    }
+
     public func discardPending() {
         discardPending(reason: .stopped)
     }
@@ -197,9 +231,11 @@ public actor BoundedUplinkQueue {
         activeGeneration = nil
         isRunning = false
         isSending = false
+        sourceHasEnded = false
         sender = nil
         failureHandler = nil
         discardPending(reason: .stopped)
+        resumeSourceEndWaiters(completed: false)
     }
 
     private func drainIfPossible() {
@@ -248,13 +284,46 @@ public actor BoundedUplinkQueue {
             isRunning = false
             sender = nil
             failureHandler = nil
+            sourceHasEnded = false
             discardPending(reason: .endpointFailure)
+            resumeSourceEndWaiters(completed: false)
             if let handler {
                 Task { await handler(error) }
             }
             return
         }
         drainIfPossible()
+        if sourceHasEnded, !isSending, pendingFrames.isEmpty {
+            completeSourceEnd(generation: generation)
+        }
+    }
+
+    private func markSourceEnded(generation: AudioFlowGeneration) {
+        guard activeGeneration == generation, isRunning else { return }
+        sourceHasEnded = true
+        drainIfPossible()
+        if !isSending, pendingFrames.isEmpty {
+            completeSourceEnd(generation: generation)
+        }
+    }
+
+    private func completeSourceEnd(generation: AudioFlowGeneration) {
+        guard activeGeneration == generation, isRunning else { return }
+        activeGeneration = nil
+        isRunning = false
+        isSending = false
+        sourceHasEnded = false
+        sender = nil
+        failureHandler = nil
+        resumeSourceEndWaiters(completed: true)
+    }
+
+    private func resumeSourceEndWaiters(completed: Bool) {
+        let waiters = sourceEndWaiters
+        sourceEndWaiters.removeAll(keepingCapacity: true)
+        for waiter in waiters {
+            waiter.resume(returning: completed)
+        }
     }
 
     private func discardExpiredFrames(at currentTime: Duration) {

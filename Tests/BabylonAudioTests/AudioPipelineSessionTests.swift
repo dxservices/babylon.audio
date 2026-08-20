@@ -48,7 +48,7 @@ struct AudioPipelineSessionTests {
             return receivedFrames == [downlinkFrame]
                 && receivedEvents == [
                     .flowStarted(flowID: flowID),
-                    .sourceEnded(flowID: flowID),
+                    .endpointEnded(flowID: flowID, direction: .downlink),
                     .flowStopped(flowID: flowID, reason: .sourceEnded),
                 ]
         })
@@ -99,6 +99,129 @@ struct AudioPipelineSessionTests {
             .flowStarted(flowID: flowID),
             .flowStopped(flowID: flowID, reason: .consumerRequested),
         ])
+    }
+
+    @Test("An external source drives monitor and uplink through source end")
+    func externalSourceDrivesSourcePlans() async throws {
+        let flowID = AudioFlowID()
+        let frames = try (0..<2).map {
+            try makeSessionFrame(flowID: flowID, sequence: UInt64($0))
+        }
+        let monitor = SessionRecordingSink()
+        let sender = SessionRecordingSender()
+        let events = SessionRecordingEventSink()
+        let configuration = try AudioPipelineConfiguration(
+            source: .external(SessionFixedSource(frames: frames)),
+            localMonitorSink: .external(monitor),
+            uplinkSender: sender,
+            eventSink: events
+        )
+        let session = AudioPipelineSession(configuration: configuration)
+
+        try await session.start(flowID: flowID)
+
+        #expect(await eventuallySession {
+            let monitoredFrames = await monitor.values()
+            let receivedEvents = await events.values()
+            return monitoredFrames == frames
+                && sender.values() == frames
+                && receivedEvents == [
+                    .flowStarted(flowID: flowID),
+                    .endpointEnded(flowID: flowID, direction: .source),
+                    .flowStopped(flowID: flowID, reason: .sourceEnded),
+                ]
+        })
+        let snapshot = await session.snapshot
+        #expect(snapshot.state == .stopped)
+        #expect(snapshot.sourceFormat == frames.last?.format)
+        #expect(!(await session.uplinkSnapshot.isRunning))
+    }
+
+    @Test("An external source failure reports the source endpoint")
+    func externalSourceFailureStopsSharedFlow() async throws {
+        let flowID = AudioFlowID()
+        let events = SessionRecordingEventSink()
+        let configuration = try AudioPipelineConfiguration(
+            source: .external(SessionFailingSource()),
+            uplinkSender: SessionRecordingSender(),
+            eventSink: events
+        )
+        let session = AudioPipelineSession(configuration: configuration)
+
+        try await session.start(flowID: flowID)
+
+        #expect(await eventuallySession {
+            await events.values() == [
+                .flowStarted(flowID: flowID),
+                .endpointFailed(flowID: flowID, direction: .source),
+                .flowStopped(flowID: flowID, reason: .endpointFailure),
+            ]
+        })
+        #expect(await session.snapshot.state == .stopped)
+    }
+
+    @Test("The first naturally ended endpoint owns shared-flow termination")
+    func firstEndedEndpointOwnsTermination() async throws {
+        let flowID = AudioFlowID()
+        let sourceFrame = try makeSessionFrame(flowID: flowID, sequence: 0)
+        let downlinkFrame = try makeSessionFrame(flowID: flowID, sequence: 1)
+        let source = SessionControlledSource()
+        let sender = SessionControlledSender()
+        let receiver = SessionControlledReceiver()
+        let downlinkSink = SessionRecordingSink()
+        let events = SessionRecordingEventSink()
+        let configuration = try AudioPipelineConfiguration(
+            source: .external(source),
+            uplinkSender: sender,
+            downlinkReceiver: receiver,
+            downlinkSink: .external(downlinkSink),
+            eventSink: events
+        )
+        let session = AudioPipelineSession(configuration: configuration)
+
+        try await session.start(flowID: flowID)
+        #expect(await eventuallySession {
+            source.isReady() && receiver.isReady()
+        })
+        source.yield(sourceFrame)
+        #expect(await eventuallySession {
+            await sender.values() == [sourceFrame]
+        })
+        source.finish()
+        #expect(await eventuallySession {
+            let receivedEvents = await events.values()
+            let uplinkSnapshot = await session.uplinkSnapshot
+            return receivedEvents == [
+                .flowStarted(flowID: flowID),
+                .endpointEnded(flowID: flowID, direction: .source),
+            ] && uplinkSnapshot.isSourceEnded
+        })
+
+        receiver.yield(downlinkFrame)
+        #expect(await eventuallySession {
+            await session.downlinkSnapshot.pending.frameCount == 1
+        })
+        receiver.finish()
+        #expect(await eventuallySession {
+            await session.naturalEndDirections == [.source, .downlink]
+        })
+        #expect(await session.snapshot.state == .running)
+        #expect(await events.values() == [
+            .flowStarted(flowID: flowID),
+            .endpointEnded(flowID: flowID, direction: .source),
+        ])
+        #expect(await downlinkSink.values().isEmpty)
+
+        await sender.complete()
+        #expect(await eventuallySession {
+            let receivedEvents = await events.values()
+            let snapshot = await session.snapshot
+            return receivedEvents == [
+                .flowStarted(flowID: flowID),
+                .endpointEnded(flowID: flowID, direction: .source),
+                .flowStopped(flowID: flowID, reason: .sourceEnded),
+            ] && snapshot.state == .stopped
+        })
     }
 
     @Test("Concurrent submissions reach monitor and sender in source order")
@@ -309,7 +432,7 @@ struct AudioPipelineSessionTests {
         #expect(await eventuallySession {
             await events.values() == [
                 .flowStarted(flowID: flowID),
-                .sourceEnded(flowID: flowID),
+                .endpointEnded(flowID: flowID, direction: .downlink),
                 .flowStopped(flowID: flowID, reason: .sourceEnded),
             ]
         })
@@ -401,7 +524,7 @@ struct AudioPipelineSessionTests {
             return receivedFrames == [frame]
                 && receivedEvents == [
                     .flowStarted(flowID: flowID),
-                    .sourceEnded(flowID: flowID),
+                    .endpointEnded(flowID: flowID, direction: .downlink),
                 ]
         })
 
@@ -411,7 +534,7 @@ struct AudioPipelineSessionTests {
 
         #expect(await events.values() == [
             .flowStarted(flowID: flowID),
-            .sourceEnded(flowID: flowID),
+            .endpointEnded(flowID: flowID, direction: .downlink),
             .flowStopped(flowID: flowID, reason: .consumerRequested),
         ])
         #expect(await session.snapshot.state == .stopped)
@@ -486,6 +609,80 @@ private struct SessionFixedReceiver: AudioFrameReceiver {
             continuation.finish()
         }
     }
+}
+
+private struct SessionFixedSource: AudioFrameSource {
+    let framesToYield: [AudioFrame]
+
+    init(frames: [AudioFrame]) {
+        framesToYield = frames
+    }
+
+    func frames(
+        for flowID: AudioFlowID
+    ) -> AsyncThrowingStream<AudioFrame, any Error> {
+        AsyncThrowingStream { continuation in
+            for frame in framesToYield where frame.flowID == flowID {
+                continuation.yield(frame)
+            }
+            continuation.finish()
+        }
+    }
+}
+
+private final class SessionControlledSource: AudioFrameSource, @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation:
+        AsyncThrowingStream<AudioFrame, any Error>.Continuation?
+
+    func frames(
+        for flowID: AudioFlowID
+    ) -> AsyncThrowingStream<AudioFrame, any Error> {
+        AsyncThrowingStream { continuation in
+            lock.withLock {
+                self.continuation = continuation
+            }
+            continuation.onTermination = { [weak self] _ in
+                self?.clearContinuation()
+            }
+        }
+    }
+
+    func isReady() -> Bool {
+        lock.withLock { continuation != nil }
+    }
+
+    func yield(_ frame: AudioFrame) {
+        let current: AsyncThrowingStream<AudioFrame, any Error>.Continuation? =
+            lock.withLock { continuation }
+        current?.yield(frame)
+    }
+
+    func finish() {
+        let current: AsyncThrowingStream<AudioFrame, any Error>.Continuation? =
+            lock.withLock { continuation }
+        current?.finish()
+    }
+
+    private func clearContinuation() {
+        lock.withLock {
+            continuation = nil
+        }
+    }
+}
+
+private struct SessionFailingSource: AudioFrameSource {
+    func frames(
+        for flowID: AudioFlowID
+    ) -> AsyncThrowingStream<AudioFrame, any Error> {
+        AsyncThrowingStream { continuation in
+            continuation.finish(throwing: SessionSourceError.failed)
+        }
+    }
+}
+
+private enum SessionSourceError: Error {
+    case failed
 }
 
 private struct SessionOpenReceiver: AudioFrameReceiver {
@@ -585,6 +782,28 @@ private final class SessionRecordingSender: AudioFrameSender, @unchecked Sendabl
 
     func values() -> [AudioFrame] {
         lock.withLock { frames }
+    }
+}
+
+private actor SessionControlledSender: AudioFrameSender {
+    private var frames: [AudioFrame] = []
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func send(_ frame: AudioFrame) async throws {
+        frames.append(frame)
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func values() -> [AudioFrame] {
+        frames
+    }
+
+    func complete() {
+        let continuation = continuation
+        self.continuation = nil
+        continuation?.resume()
     }
 }
 

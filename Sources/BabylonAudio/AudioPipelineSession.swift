@@ -18,7 +18,10 @@ public actor AudioPipelineSession {
     private let sourceGate = AudioPipelineSerialGate()
 
     private var activeGeneration: AudioFlowGeneration?
+    private var sourceTask: Task<Void, Never>?
     private var receiverTask: Task<Void, Never>?
+    private var naturalEndDirection: AudioDirection?
+    private var observedNaturalEndDirections: Set<AudioDirection> = []
     private var state: AudioPipelineState = .idle
     private var usedFlowIDs: Set<AudioFlowID> = []
     private var activeLocalMonitorSink: (any AudioFrameSink)?
@@ -68,6 +71,10 @@ public actor AudioPipelineSession {
         }
     }
 
+    var naturalEndDirections: Set<AudioDirection> {
+        observedNaturalEndDirections
+    }
+
     public func start(flowID: AudioFlowID = AudioFlowID()) async throws {
         guard activeGeneration == nil else {
             throw AudioPipelineSessionError.alreadyRunning
@@ -75,10 +82,14 @@ public actor AudioPipelineSession {
         guard !usedFlowIDs.contains(flowID) else {
             throw AudioPipelineSessionError.reusedFlowID
         }
-        if let source = configuration.source {
-            guard case .externalFrames = source else {
-                throw AudioPipelineSessionError.sourceDrivenPlanNotAvailable
-            }
+        let activeSource: (any AudioFrameSource)?
+        switch configuration.source {
+        case .external(let source):
+            activeSource = source
+        case .externalFrames, nil:
+            activeSource = nil
+        case .microphone:
+            throw AudioPipelineSessionError.sourceDrivenPlanNotAvailable
         }
 
         let localMonitorSink: (any AudioFrameSink)?
@@ -104,6 +115,8 @@ public actor AudioPipelineSession {
         let generation = AudioFlowGeneration(flowID: flowID)
         usedFlowIDs.insert(flowID)
         activeGeneration = generation
+        naturalEndDirection = nil
+        observedNaturalEndDirections = []
         state = .running
         activeLocalMonitorSink = localMonitorSink
         sourceFormat = nil
@@ -134,6 +147,25 @@ public actor AudioPipelineSession {
         await emit(.flowStarted(flowID: flowID))
         guard activeGeneration == generation else { return }
 
+        if let activeSource {
+            sourceTask = Task { [weak self] in
+                do {
+                    for try await frame in activeSource.frames(for: flowID) {
+                        try Task.checkCancellation()
+                        try await self?.deliverSourceFrame(
+                            frame,
+                            generation: generation
+                        )
+                    }
+                    await self?.sourceEnded(generation: generation)
+                } catch is CancellationError {
+                    return
+                } catch {
+                    await self?.sourceFailed(generation: generation)
+                }
+            }
+        }
+
         guard let receiver = configuration.downlinkReceiver else { return }
         receiverTask = Task { [weak self] in
             do {
@@ -151,6 +183,19 @@ public actor AudioPipelineSession {
     }
 
     public func submit(_ frame: AudioFrame) async throws {
+        guard let generation = activeGeneration else {
+            throw AudioPipelineSessionError.notRunning
+        }
+        guard case .externalFrames = configuration.source else {
+            throw AudioPipelineSessionError.externalFramesNotConfigured
+        }
+        try await deliverSourceFrame(frame, generation: generation)
+    }
+
+    private func deliverSourceFrame(
+        _ frame: AudioFrame,
+        generation: AudioFlowGeneration
+    ) async throws {
         await sourceGate.acquire()
         do {
             try Task.checkCancellation()
@@ -158,13 +203,9 @@ public actor AudioPipelineSession {
             await sourceGate.release()
             throw error
         }
-        guard let generation = activeGeneration else {
+        guard activeGeneration == generation else {
             await sourceGate.release()
             throw AudioPipelineSessionError.notRunning
-        }
-        guard case .externalFrames = configuration.source else {
-            await sourceGate.release()
-            throw AudioPipelineSessionError.externalFramesNotConfigured
         }
         guard frame.flowID == generation.flowID else {
             await sourceGate.release()
@@ -192,6 +233,43 @@ public actor AudioPipelineSession {
         }
     }
 
+    private func sourceEnded(generation: AudioFlowGeneration) async {
+        guard activeGeneration == generation else { return }
+        sourceTask = nil
+        observedNaturalEndDirections.insert(.source)
+        guard claimNaturalEnd(
+            direction: .source,
+            generation: generation
+        ) else { return }
+        await emit(.endpointEnded(
+            flowID: generation.flowID,
+            direction: .source
+        ))
+        guard activeGeneration == generation else { return }
+        if configuration.uplinkSender != nil {
+            let completed = await uplink.finishSource(
+                flowID: generation.flowID
+            )
+            guard completed, activeGeneration == generation else { return }
+        }
+        await finish(
+            generation: generation,
+            reason: .sourceEnded,
+            stopDownlink: true
+        )
+    }
+
+    private func sourceFailed(generation: AudioFlowGeneration) async {
+        guard activeGeneration == generation else { return }
+        sourceTask = nil
+        await finish(
+            generation: generation,
+            reason: .endpointFailure,
+            stopDownlink: true,
+            endpointDirection: .source
+        )
+    }
+
     public func stop() async {
         guard let generation = activeGeneration else { return }
         await finish(
@@ -212,7 +290,15 @@ public actor AudioPipelineSession {
     private func receiverEnded(generation: AudioFlowGeneration) async {
         guard activeGeneration == generation else { return }
         receiverTask = nil
-        await emit(.sourceEnded(flowID: generation.flowID))
+        observedNaturalEndDirections.insert(.downlink)
+        guard claimNaturalEnd(
+            direction: .downlink,
+            generation: generation
+        ) else { return }
+        await emit(.endpointEnded(
+            flowID: generation.flowID,
+            direction: .downlink
+        ))
         guard activeGeneration == generation else { return }
         let completed = await downlink.finishSource(flowID: generation.flowID)
         guard completed, activeGeneration == generation else { return }
@@ -244,6 +330,19 @@ public actor AudioPipelineSession {
         )
     }
 
+    private func claimNaturalEnd(
+        direction: AudioDirection,
+        generation: AudioFlowGeneration
+    ) -> Bool {
+        guard activeGeneration == generation,
+              naturalEndDirection == nil
+        else {
+            return false
+        }
+        naturalEndDirection = direction
+        return true
+    }
+
     private func finish(
         generation: AudioFlowGeneration,
         reason: AudioFlowStopReason,
@@ -252,9 +351,13 @@ public actor AudioPipelineSession {
     ) async {
         guard activeGeneration == generation else { return }
         activeGeneration = nil
+        naturalEndDirection = nil
         state = .stopped
+        let source = sourceTask
+        sourceTask = nil
         let task = receiverTask
         receiverTask = nil
+        source?.cancel()
         task?.cancel()
         activeLocalMonitorSink = nil
         await uplink.stop()

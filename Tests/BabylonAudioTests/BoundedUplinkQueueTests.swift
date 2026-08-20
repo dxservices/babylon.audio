@@ -31,6 +31,89 @@ struct BoundedUplinkQueueTests {
         #expect(await eventually { !(await queue.snapshot.isSending) })
     }
 
+    @Test("Source end waits for every accepted send before completing")
+    func sourceEndDrainsAcceptedTail() async throws {
+        let sender = ControlledUplinkSender()
+        let queue = BoundedUplinkQueue(
+            policy: try BoundedUplinkQueuePolicy(
+                maximumPendingAudioDuration: .seconds(1),
+                maximumFrameAge: .seconds(2)
+            )
+        )
+        let flowID = AudioFlowID()
+        await queue.start(flowID: flowID, sender: sender)
+        await queue.enqueue(try makeUplinkFrame(flowID: flowID, sequence: 0))
+        await queue.enqueue(try makeUplinkFrame(flowID: flowID, sequence: 1))
+        #expect(await eventually { await sender.sentSequences() == [0] })
+
+        let completion = Task {
+            await queue.finishSource(flowID: flowID)
+        }
+        await sender.completeNext()
+        #expect(await eventually { await sender.sentSequences() == [0, 1] })
+        #expect(await queue.snapshot.isRunning)
+        await sender.completeNext()
+
+        #expect(await completion.value)
+        let snapshot = await queue.snapshot
+        #expect(!snapshot.isRunning)
+        #expect(snapshot.pending == .zero)
+        #expect(snapshot.discardedFrameCount == 0)
+    }
+
+    @Test("Frames arriving during source-end drain have a distinct discard reason")
+    func sourceEndRejectsLateFramesDistinctly() async throws {
+        let sender = ControlledUplinkSender()
+        let diagnostics = RecordingUplinkDiagnostics()
+        let queue = BoundedUplinkQueue(diagnosticSink: diagnostics)
+        let flowID = AudioFlowID()
+        await queue.start(flowID: flowID, sender: sender)
+        let inFlight = try makeUplinkFrame(flowID: flowID, sequence: 0)
+        let late = try makeUplinkFrame(flowID: flowID, sequence: 1)
+        await queue.enqueue(inFlight)
+        #expect(await eventually { await sender.sentSequences() == [0] })
+
+        let completion = Task {
+            await queue.finishSource(flowID: flowID)
+        }
+        #expect(await eventually { await queue.snapshot.isSourceEnded })
+        await queue.enqueue(late)
+
+        #expect(await eventually {
+            await diagnostics.events().contains(.queueDiscarded(
+                flowID: flowID,
+                direction: .uplink,
+                reason: .sourceEnded,
+                frameCount: 1,
+                duration: late.duration
+            ))
+        })
+        await sender.completeNext()
+        #expect(await completion.value)
+    }
+
+    @Test("Stop interrupts a pending source-end drain")
+    func stopInterruptsSourceEndDrain() async throws {
+        let sender = ControlledUplinkSender()
+        let queue = BoundedUplinkQueue()
+        let flowID = AudioFlowID()
+        await queue.start(flowID: flowID, sender: sender)
+        await queue.enqueue(try makeUplinkFrame(flowID: flowID, sequence: 0))
+        #expect(await eventually { await sender.sentSequences() == [0] })
+
+        let completion = Task {
+            await queue.finishSource(flowID: flowID)
+        }
+        for _ in 0..<10 { await Task.yield() }
+        await queue.stop()
+
+        #expect(!(await completion.value))
+        await sender.completeNext()
+        for _ in 0..<10 { await Task.yield() }
+        #expect(!(await queue.snapshot.isRunning))
+        #expect(await sender.sentSequences() == [0])
+    }
+
     @Test("Overflow drops the oldest pending frame using format-derived duration")
     func dropsOldestPendingFrame() async throws {
         let sender = ControlledUplinkSender()
