@@ -122,9 +122,21 @@ ownership tokens so late frames or failures cannot stop a newer capture.
 
 This slice does not configure an audio session, select a route, enable voice
 processing, or start the engine. Those safety transitions remain caller-owned
-until the route/runtime orchestration slice lands. Device-sink plans still fail
-explicitly at start; fake-backed tests prove the normalized engine boundary,
-not physical microphone conversion on Simulator.
+until the route/runtime orchestration slice lands. Fake-backed tests prove the
+normalized engine boundary, not physical microphone conversion on Simulator.
+
+Local-monitor and downlink `.device` sinks resolve to that same injected
+`AudioDeviceEngine`; the session never creates a second graph. Device playback
+requires the shared engine to be running with one exact format configured
+before start. A microphone-to-device local monitor additionally requires that
+format to match its normalized capture format. Natural downlink completion
+drains eligible accepted frames through the data-consumed scheduling boundary,
+not audible completion, before terminal delivery. Consumer stop, failure, or
+stopping a flow before starting its replacement stops device playback to
+release pending consumes, but leaves the shared engine running for the external
+safety/runtime owner. This shared-engine wiring does not by itself prove a safe
+private route or physical playback; route evaluation and output unmute remain
+the runtime owner's fail-closed responsibility.
 
 The deterministic session suite also composes local monitor, uplink, and
 downlink in one configuration. Both source-driven branches observe the same

@@ -341,6 +341,161 @@ struct AudioPipelineSessionTests {
         #expect(await backend.stopCaptureCount == 2)
     }
 
+    @Test("Microphone, local monitor, and downlink share one device engine")
+    @MainActor
+    func devicePlansShareInjectedEngine() async throws {
+        let flowID = AudioFlowID()
+        let format = try AudioStreamFormat.monoPCM16(sampleRate: 24_000)
+        let settings = try makeSessionCaptureSettings()
+        let sourceFrame = try makeSessionFrame(flowID: flowID, sequence: 0)
+        let downlinkFrame = try makeSessionFrame(flowID: flowID, sequence: 1)
+        let backend = SessionDeviceEngineBackend()
+        let engine = AudioDeviceEngine(backend: backend)
+        let sender = SessionRecordingSender()
+        let receiver = SessionControlledReceiver()
+        let events = SessionRecordingEventSink()
+        try engine.configurePlayback(format: format)
+        try engine.start()
+        let configuration = try AudioPipelineConfiguration(
+            source: .microphone(AudioMicrophoneSourceConfiguration(
+                inputPolicy: .builtInMicrophoneRequired,
+                capture: settings
+            )),
+            localMonitorSink: .device(policy: .privateOutputRequired),
+            uplinkSender: sender,
+            downlinkReceiver: receiver,
+            downlinkSink: .device(policy: .privateOutputRequired),
+            eventSink: events
+        )
+        let session = AudioPipelineSession(
+            configuration: configuration,
+            deviceEngine: engine
+        )
+
+        try await session.start(flowID: flowID)
+        #expect(await eventuallySession { receiver.isReady() })
+        try await backend.deliverCapture(sourceFrame, at: 0)
+        #expect(await eventuallySession {
+            let playbackSequences = await backend.playbackSequences
+            return sender.values() == [sourceFrame]
+                && playbackSequences == [sourceFrame.sequence]
+        })
+
+        receiver.yield(downlinkFrame)
+        receiver.finish()
+        #expect(await eventuallySession {
+            await events.values() == [
+                .flowStarted(flowID: flowID),
+                .endpointEnded(flowID: flowID, direction: .downlink),
+                .flowStopped(flowID: flowID, reason: .sourceEnded),
+            ]
+        })
+        #expect(backend.playbackSequences == [
+            sourceFrame.sequence,
+            downlinkFrame.sequence,
+        ])
+        #expect(backend.stopCaptureCount == 1)
+        #expect(backend.stopPlaybackCount == 1)
+        #expect(engine.isRunning)
+        #expect(!engine.isCapturing)
+    }
+
+    @Test("Device sinks require one running playback-configured engine")
+    @MainActor
+    func deviceSinksRequireReadyEngine() async throws {
+        let format = try AudioStreamFormat.monoPCM16(sampleRate: 24_000)
+        let configuration = try AudioPipelineConfiguration(
+            source: .externalFrames,
+            localMonitorSink: .device(policy: .privateOutputRequired)
+        )
+        await #expect(throws: AudioPipelineSessionError.deviceRuntimeRequired) {
+            try await AudioPipelineSession(
+                configuration: configuration
+            ).start()
+        }
+
+        let stoppedEngine = AudioDeviceEngine(
+            backend: SessionDeviceEngineBackend()
+        )
+        try stoppedEngine.configurePlayback(format: format)
+        await #expect(throws: AudioDeviceEngineError.engineNotRunning) {
+            try await AudioPipelineSession(
+                configuration: configuration,
+                deviceEngine: stoppedEngine
+            ).start()
+        }
+
+        let unconfiguredEngine = AudioDeviceEngine(
+            backend: SessionDeviceEngineBackend()
+        )
+        try unconfiguredEngine.start()
+        await #expect(throws: AudioDeviceEngineError.playbackNotConfigured) {
+            try await AudioPipelineSession(
+                configuration: configuration,
+                deviceEngine: unconfiguredEngine
+            ).start()
+        }
+
+        let mismatchEngine = AudioDeviceEngine(
+            backend: SessionDeviceEngineBackend()
+        )
+        try mismatchEngine.configurePlayback(
+            format: .monoPCM16(sampleRate: 16_000)
+        )
+        try mismatchEngine.start()
+        let microphoneMonitor = try AudioPipelineConfiguration(
+            source: .microphone(AudioMicrophoneSourceConfiguration(
+                inputPolicy: .builtInMicrophoneRequired,
+                capture: makeSessionCaptureSettings()
+            )),
+            localMonitorSink: .device(policy: .privateOutputRequired)
+        )
+        await #expect(throws: AudioDeviceEngineError.playbackFormatMismatch) {
+            try await AudioPipelineSession(
+                configuration: microphoneMonitor,
+                deviceEngine: mismatchEngine
+            ).start()
+        }
+    }
+
+    @Test("Consumer stop terminates pending device playback")
+    @MainActor
+    func consumerStopTerminatesDevicePlayback() async throws {
+        let flowID = AudioFlowID()
+        let frame = try makeSessionFrame(flowID: flowID, sequence: 7)
+        let backend = SessionDeviceEngineBackend(suspendsPlayback: true)
+        let engine = AudioDeviceEngine(backend: backend)
+        try engine.configurePlayback(format: frame.format)
+        try engine.start()
+        let configuration = try AudioPipelineConfiguration(
+            source: .externalFrames,
+            localMonitorSink: .device(policy: .privateOutputRequired)
+        )
+        let session = AudioPipelineSession(
+            configuration: configuration,
+            deviceEngine: engine
+        )
+        try await session.start(flowID: flowID)
+        let submission = Task {
+            try await session.submit(frame)
+        }
+        #expect(await eventuallySession {
+            await backend.pendingPlaybackSequences == [frame.sequence]
+        })
+
+        await session.stop()
+
+        do {
+            try await submission.value
+            Issue.record("Expected device playback stop to fail submission")
+        } catch {
+            #expect(error as? AudioDeviceEngineError == .playbackStopped)
+        }
+        #expect(backend.stopPlaybackCount == 1)
+        #expect(engine.isRunning)
+        #expect(await session.snapshot.state == .stopped)
+    }
+
     @Test("The first naturally ended endpoint owns shared-flow termination")
     func firstEndedEndpointOwnsTermination() async throws {
         let flowID = AudioFlowID()
@@ -885,16 +1040,34 @@ private enum SessionCaptureError: Error {
 private final class SessionDeviceEngineBackend: AudioDeviceEngineBackend {
     private(set) var captureConfigurations: [AudioCaptureConfiguration] = []
     private(set) var stopCaptureCount = 0
+    private(set) var playbackFormats: [AudioStreamFormat] = []
+    private(set) var playbackSequences: [UInt64] = []
+    private(set) var stopPlaybackCount = 0
     private var captureHandlers: [AudioCaptureFrameHandler] = []
     private var captureFailureHandlers: [AudioCaptureFailureHandler?] = []
+    private var playbackContinuations:
+        [UInt64: CheckedContinuation<Void, any Error>] = [:]
+    private let suspendsPlayback: Bool
+
+    init(suspendsPlayback: Bool = false) {
+        self.suspendsPlayback = suspendsPlayback
+    }
 
     func start() throws {}
     func stop() {}
-    func configurePlayback(format: AudioStreamFormat) throws {}
+    func configurePlayback(format: AudioStreamFormat) throws {
+        playbackFormats.append(format)
+    }
     func configureVoiceProcessing(
         _ policy: AudioVoiceProcessingPolicy
     ) throws {}
-    func schedulePlayback(_ frame: AudioFrame) async throws {}
+    func schedulePlayback(_ frame: AudioFrame) async throws {
+        playbackSequences.append(frame.sequence)
+        guard suspendsPlayback else { return }
+        try await withCheckedThrowingContinuation { continuation in
+            playbackContinuations[frame.sequence] = continuation
+        }
+    }
     func setOutputMuted(_ muted: Bool) {}
 
     func startCapture(
@@ -911,7 +1084,16 @@ private final class SessionDeviceEngineBackend: AudioDeviceEngineBackend {
         stopCaptureCount += 1
     }
 
-    func stopPlayback() {}
+    func stopPlayback() {
+        stopPlaybackCount += 1
+        let continuations = Array(playbackContinuations.values)
+        playbackContinuations.removeAll()
+        for continuation in continuations {
+            continuation.resume(
+                throwing: AudioDeviceEngineError.playbackStopped
+            )
+        }
+    }
     func rebuildAfterMediaServicesReset() {}
 
     func deliverCapture(_ frame: AudioFrame, at index: Int) async throws {
@@ -920,6 +1102,10 @@ private final class SessionDeviceEngineBackend: AudioDeviceEngineBackend {
 
     func failCapture(at index: Int, error: any Error) async {
         await captureFailureHandlers[index]?(error)
+    }
+
+    var pendingPlaybackSequences: [UInt64] {
+        playbackContinuations.keys.sorted()
     }
 }
 

@@ -35,6 +35,7 @@ public actor AudioPipelineSession {
     private var state: AudioPipelineState = .idle
     private var usedFlowIDs: Set<AudioFlowID> = []
     private var activeLocalMonitorSink: (any AudioFrameSink)?
+    private var activeUsesDevicePlayback = false
     private var sourceFormat: AudioStreamFormat?
 
     public init(
@@ -114,12 +115,17 @@ public actor AudioPipelineSession {
             microphoneCapture = microphone.capture
         }
 
+        let usesDevicePlayback = configurationUsesDevicePlayback
+        if usesDevicePlayback {
+            try await validateDevicePlaybackRuntime()
+        }
+
         let localMonitorSink: (any AudioFrameSink)?
         switch configuration.localMonitorSink {
         case .external(let sink):
             localMonitorSink = sink
         case .device:
-            throw AudioPipelineSessionError.deviceRuntimeRequired
+            localMonitorSink = deviceEngine
         case nil:
             localMonitorSink = nil
         }
@@ -129,7 +135,7 @@ public actor AudioPipelineSession {
         case .external(let sink):
             downlinkSink = sink
         case .device:
-            throw AudioPipelineSessionError.deviceRuntimeRequired
+            downlinkSink = deviceEngine
         case nil:
             downlinkSink = nil
         }
@@ -141,6 +147,7 @@ public actor AudioPipelineSession {
         observedNaturalEndDirections = []
         state = .running
         activeLocalMonitorSink = localMonitorSink
+        activeUsesDevicePlayback = usesDevicePlayback
         sourceFormat = nil
         if let sender = configuration.uplinkSender {
             await uplink.start(
@@ -209,6 +216,32 @@ public actor AudioPipelineSession {
             } catch {
                 await self?.receiverFailed(error, generation: generation)
             }
+        }
+    }
+
+    private var configurationUsesDevicePlayback: Bool {
+        if case .device = configuration.localMonitorSink { return true }
+        if case .device = configuration.downlinkSink { return true }
+        return false
+    }
+
+    private func validateDevicePlaybackRuntime() async throws {
+        guard let deviceEngine else {
+            throw AudioPipelineSessionError.deviceRuntimeRequired
+        }
+        guard await deviceEngine.isRunning else {
+            throw AudioDeviceEngineError.engineNotRunning
+        }
+        guard let playbackFormat = await deviceEngine.playbackFormat else {
+            throw AudioDeviceEngineError.playbackNotConfigured
+        }
+        guard case .microphone(let microphone) = configuration.source,
+              case .device = configuration.localMonitorSink
+        else {
+            return
+        }
+        guard playbackFormat == microphone.capture.format else {
+            throw AudioDeviceEngineError.playbackFormatMismatch
         }
     }
 
@@ -469,6 +502,8 @@ public actor AudioPipelineSession {
         receiverTask = nil
         let captureToken = microphoneCaptureToken
         microphoneCaptureToken = nil
+        let stopsDevicePlayback = activeUsesDevicePlayback
+        activeUsesDevicePlayback = false
         let pendingCaptureStart = pendingMicrophoneCaptureStart.flatMap {
             $0.generation == generation ? $0 : nil
         }
@@ -484,6 +519,9 @@ public actor AudioPipelineSession {
             await deviceEngine?.stopCapture(token: acquiredToken)
         }
         clearPendingMicrophoneCaptureStart(generation: generation)
+        if stopsDevicePlayback {
+            await deviceEngine?.stopPlayback()
+        }
         await uplink.stop()
         if stopDownlink {
             await downlink.stop()

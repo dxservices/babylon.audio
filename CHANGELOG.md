@@ -39,6 +39,8 @@ All notable changes to this project will be documented in this file.
   validation, bounded uplink fan-out, and source-failure lifecycle handling.
 - Isolate capture ownership so stale frame/failure callbacks and old iOS
   handoff drains cannot clear or stop a replacement capture.
+- Resolve local-monitor and downlink device sinks through the same injected
+  playback-configured engine, with pending-playback termination on flow stop.
 - Verify local monitor, uplink, and downlink composition under one pipeline
   session, flow identifier, and terminal lifecycle.
 - Add content-free streaming snapshots and diagnostics for queue duration,
