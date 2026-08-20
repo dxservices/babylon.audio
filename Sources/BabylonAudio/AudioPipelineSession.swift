@@ -33,6 +33,7 @@ public actor AudioPipelineSession {
     private let sourceGate = AudioPipelineSerialGate()
     private let safetyBoundaryLatch = AudioPipelineSafetyBoundaryLatch()
     private let startAttemptSuspension: (@Sendable () async -> Void)?
+    private let stopWaitObservation: (@Sendable () -> Void)?
 
     private var activeGeneration: AudioFlowGeneration?
     private var activeSafetyRevision: UInt64?
@@ -64,6 +65,7 @@ public actor AudioPipelineSession {
         self.configuration = configuration
         self.deviceEngine = deviceEngine
         startAttemptSuspension = nil
+        stopWaitObservation = nil
         uplink = BoundedUplinkQueue(
             policy: uplinkPolicy,
             diagnosticSink: configuration.diagnosticSink
@@ -80,11 +82,13 @@ public actor AudioPipelineSession {
         deviceEngine: AudioDeviceEngine? = nil,
         uplinkPolicy: BoundedUplinkQueuePolicy = .initial,
         downlinkPolicy: BoundedDownlinkJitterBufferPolicy = .initial,
-        startAttemptSuspension: @escaping @Sendable () async -> Void
+        startAttemptSuspension: @escaping @Sendable () async -> Void,
+        stopWaitObservation: (@Sendable () -> Void)? = nil
     ) {
         self.configuration = configuration
         self.deviceEngine = deviceEngine
         self.startAttemptSuspension = startAttemptSuspension
+        self.stopWaitObservation = stopWaitObservation
         uplink = BoundedUplinkQueue(
             policy: uplinkPolicy,
             diagnosticSink: configuration.diagnosticSink
@@ -613,12 +617,29 @@ public actor AudioPipelineSession {
     }
 
     public func stop() async {
-        guard let generation = activeGeneration else { return }
-        await finish(
-            generation: generation,
-            reason: .consumerRequested,
-            stopDownlink: true
-        )
+        while true {
+            if let generation = activeGeneration {
+                await finish(
+                    generation: generation,
+                    reason: .consumerRequested,
+                    stopDownlink: true
+                )
+                continue
+            }
+            if pendingStartAttempt != nil {
+                await waitForPendingStartAttempt(
+                    onWait: stopWaitObservation
+                )
+                continue
+            }
+            if finishingGeneration != nil {
+                await waitForFinishingGeneration(
+                    onWait: stopWaitObservation
+                )
+                continue
+            }
+            return
+        }
     }
 
     nonisolated func latchSafetyBoundary() -> UInt64 {
@@ -820,17 +841,23 @@ public actor AudioPipelineSession {
         }
     }
 
-    private func waitForFinishingGeneration() async {
+    private func waitForFinishingGeneration(
+        onWait: (@Sendable () -> Void)? = nil
+    ) async {
         guard finishingGeneration != nil else { return }
         await withCheckedContinuation { continuation in
             finishWaiters.append(continuation)
+            onWait?()
         }
     }
 
-    private func waitForPendingStartAttempt() async {
+    private func waitForPendingStartAttempt(
+        onWait: (@Sendable () -> Void)? = nil
+    ) async {
         guard pendingStartAttempt != nil else { return }
         await withCheckedContinuation { continuation in
             pendingStartWaiters.append(continuation)
+            onWait?()
         }
     }
 

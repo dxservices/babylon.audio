@@ -79,11 +79,17 @@ generation and prevents a late tail completion from producing another stop
 event.
 
 Session events are serialized through completion even when lifecycle methods
-overlap. An `AudioEventSink` must return after handing the event to its consumer
-state machine; it must not await a lifecycle method on the same session because
-that method may be waiting for the current event delivery to finish. Each flow
-identifier is single-use within one session instance, so a late completion can
-never match a later generation that happens to reuse the same identifier.
+overlap. Public `stop()` is a completion barrier: it waits for an already-owned
+terminal lifecycle and for an overlapping start attempt, stopping any generation
+that start activates before it returns. A subsequent start therefore cannot
+race old processor reset, queue cleanup, or terminal event delivery. An
+`AudioEventSink` must return after handing the event to its consumer state
+machine; it must not await a lifecycle method on the same session because that
+method may be waiting for the current event delivery to finish. The sink may
+spawn a recovery task without awaiting it; after the callback returns, that task
+can wait for `stop()` and then restart. Each flow identifier is single-use within
+one session instance, so a late completion can never match a later generation
+that happens to reuse the same identifier.
 
 Caller-driven `.externalFrames` can now fan each accepted frame into an external
 local-monitor sink and a format-aware bounded uplink queue under the same flow

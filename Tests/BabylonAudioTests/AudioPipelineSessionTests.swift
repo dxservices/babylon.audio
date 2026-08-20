@@ -657,41 +657,115 @@ struct AudioPipelineSessionTests {
         #expect(await session.snapshot.state == .stopped)
     }
 
-    @Test("Caller stop cannot rewrite an uplink failure after terminal ownership")
-    func concurrentStopDoesNotRewriteUplinkFailure() async throws {
-        let flowID = AudioFlowID()
-        let events = SessionSuspendingEventSink(suspendingAt: 2)
+    @Test("Recovery stop waits for endpoint-failure delivery before restart")
+    func recoveryStopWaitsForEndpointFailureBarrier() async throws {
+        let failedFlowID = AudioFlowID()
+        let replacementFlowID = AudioFlowID()
+        let sender = SessionFailOnceSender()
+        let events = SessionRecoveryStopEventSink()
+        let stopWaitObservation = SessionStopWaitObservation()
+        let processorResetRecorder = SessionProcessorResetRecorder()
         let configuration = try AudioPipelineConfiguration(
             source: .externalFrames,
-            uplinkSender: SessionFailingSender(),
+            sourceProcessorChain: makeSessionProcessorChain([
+                SessionFirstFramePerGenerationProcessor(
+                    resetRecorder: processorResetRecorder
+                ),
+            ]),
+            uplinkSender: sender,
             eventSink: events
         )
-        let session = AudioPipelineSession(configuration: configuration)
-        try await session.start(flowID: flowID)
+        let session = AudioPipelineSession(
+            configuration: configuration,
+            startAttemptSuspension: {},
+            stopWaitObservation: {
+                stopWaitObservation.record()
+            }
+        )
+        events.attach(session: session)
+        try await session.start(flowID: failedFlowID)
+        #expect(processorResetRecorder.count == 1)
         try await session.submit(try makeSessionFrame(
-            flowID: flowID,
+            flowID: failedFlowID,
             sequence: 0
         ))
         #expect(await eventuallySession {
             events.values() == [
-                .flowStarted(flowID: flowID),
-                .endpointFailed(flowID: flowID, direction: .uplink),
-            ] && events.isSuspended()
+                .flowStarted(flowID: failedFlowID),
+                .endpointFailed(flowID: failedFlowID, direction: .uplink),
+                .flowStopped(
+                    flowID: failedFlowID,
+                    reason: .endpointFailure
+                ),
+            ] && events.isTerminalDeliverySuspended()
         })
 
-        await session.stop()
-        #expect(events.values() == [
-            .flowStarted(flowID: flowID),
-            .endpointFailed(flowID: flowID, direction: .uplink),
-        ])
-        events.resumeSuspendedDelivery()
+        await stopWaitObservation.waitUntilCount(1)
+        #expect(!events.isRecoveryStopComplete())
+        events.resumeTerminalDelivery()
+        await events.waitForRecoveryStop()
+        #expect(events.isRecoveryStopComplete())
+        #expect(processorResetRecorder.count == 2)
+
+        try await session.start(flowID: replacementFlowID)
+        #expect(processorResetRecorder.count == 3)
+        let replacementFrame = try makeSessionFrame(
+            flowID: replacementFlowID,
+            sequence: 1
+        )
+        try await session.submit(replacementFrame)
         #expect(await eventuallySession {
-            events.values() == [
-                .flowStarted(flowID: flowID),
-                .endpointFailed(flowID: flowID, direction: .uplink),
-                .flowStopped(flowID: flowID, reason: .endpointFailure),
-            ]
+            await sender.values() == [replacementFrame]
         })
+        #expect(events.values() == [
+            .flowStarted(flowID: failedFlowID),
+            .endpointFailed(flowID: failedFlowID, direction: .uplink),
+            .flowStopped(flowID: failedFlowID, reason: .endpointFailure),
+            .flowStarted(flowID: replacementFlowID),
+        ])
+        await session.stop()
+    }
+
+    @Test("Consumer stop waits for a pending start before returning idle")
+    func consumerStopWaitsForPendingStart() async throws {
+        let pendingFlowID = AudioFlowID()
+        let replacementFlowID = AudioFlowID()
+        let startGate = SessionFirstStartAttemptGate()
+        let stopProbe = SessionCompletionProbe()
+        let stopWaitObservation = SessionStopWaitObservation()
+        let configuration = try AudioPipelineConfiguration(
+            source: .externalFrames,
+            localMonitorSink: .external(SessionRecordingSink())
+        )
+        let session = AudioPipelineSession(
+            configuration: configuration,
+            startAttemptSuspension: {
+                await startGate.suspendFirstAttempt()
+            },
+            stopWaitObservation: {
+                stopWaitObservation.record()
+            }
+        )
+        let pendingStart = Task {
+            try await session.start(flowID: pendingFlowID)
+        }
+        await startGate.waitUntilFirstAttemptIsSuspended()
+
+        let stop = Task {
+            await session.stop()
+            await stopProbe.complete()
+        }
+        await stopWaitObservation.waitUntilCount(1)
+        #expect(!(await stopProbe.isComplete))
+
+        await startGate.resumeFirstAttempt()
+        try await pendingStart.value
+        await stop.value
+        #expect(await stopProbe.isComplete)
+
+        try await session.start(flowID: replacementFlowID)
+        #expect(await session.snapshot.flowID == replacementFlowID)
+        await session.stop()
     }
 
     @Test("A local-monitor failure stops the shared flow and reaches the caller")
@@ -1750,6 +1824,56 @@ private actor SessionCompletionProbe {
     }
 }
 
+private final class SessionStopWaitObservation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    private var waiters: [
+        (target: Int, continuation: CheckedContinuation<Void, Never>)
+    ] = []
+
+    func record() {
+        let ready: [CheckedContinuation<Void, Never>] = lock.withLock {
+            count += 1
+            let ready = waiters
+                .filter { $0.target <= count }
+                .map(\.continuation)
+            waiters.removeAll { $0.target <= count }
+            return ready
+        }
+        for continuation in ready {
+            continuation.resume()
+        }
+    }
+
+    func waitUntilCount(_ target: Int) async {
+        await withCheckedContinuation { continuation in
+            let isAlreadyObserved: Bool = lock.withLock {
+                guard count < target else { return true }
+                waiters.append((target, continuation))
+                return false
+            }
+            if isAlreadyObserved {
+                continuation.resume()
+            }
+        }
+    }
+}
+
+private final class SessionProcessorResetRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var resetCount = 0
+
+    var count: Int {
+        lock.withLock { resetCount }
+    }
+
+    func recordReset() {
+        lock.withLock {
+            resetCount += 1
+        }
+    }
+}
+
 @MainActor
 private final class SessionSafetyAudioSession: AudioSessionControlling {
     let routeSnapshot = AudioRouteSnapshot.empty
@@ -1943,6 +2067,23 @@ private struct SessionFailingSender: AudioFrameSender {
     }
 }
 
+private actor SessionFailOnceSender: AudioFrameSender {
+    private var hasFailed = false
+    private var acceptedFrames: [AudioFrame] = []
+
+    func send(_ frame: AudioFrame) async throws {
+        guard hasFailed else {
+            hasFailed = true
+            throw SessionSenderError.failed
+        }
+        acceptedFrames.append(frame)
+    }
+
+    func values() -> [AudioFrame] {
+        acceptedFrames
+    }
+}
+
 private enum SessionSenderError: Error {
     case failed
 }
@@ -1999,6 +2140,36 @@ private struct SessionDropOrDuplicateProcessor: AudioFrameProcessor {
     }
 
     mutating func reset() {}
+}
+
+private struct SessionFirstFramePerGenerationProcessor: AudioFrameProcessor {
+    let declaration = AudioFrameProcessorDeclaration(
+        algorithmicWindow: .zero,
+        maximumInternalBufferDuration: .zero,
+        maximumOutputFrameCount: 1,
+        formatBehavior: .preservesInput,
+        retainsSensitiveState: true
+    )
+    private let resetRecorder: SessionProcessorResetRecorder
+    private var hasEmittedFrame = false
+
+    init(resetRecorder: SessionProcessorResetRecorder) {
+        self.resetRecorder = resetRecorder
+    }
+
+    mutating func process(
+        _ frame: AudioFrame,
+        emit: @Sendable (AudioFrame) -> Void
+    ) throws {
+        guard !hasEmittedFrame else { return }
+        hasEmittedFrame = true
+        emit(frame)
+    }
+
+    mutating func reset() {
+        hasEmittedFrame = false
+        resetRecorder.recordReset()
+    }
 }
 
 private struct SessionFailingProcessor: AudioFrameProcessor {
@@ -2164,6 +2335,90 @@ private final class SessionSuspendingEventSink: AudioEventSink, @unchecked Senda
             return continuation
         }
         continuation?.resume()
+    }
+}
+
+private final class SessionRecoveryStopEventSink:
+    AudioEventSink,
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private weak var session: AudioPipelineSession?
+    private var events: [AudioEvent] = []
+    private var recoveryStopTask: Task<Void, Never>?
+    private var recoveryStopComplete = false
+    private var hasSuspendedTerminalDelivery = false
+    private var terminalDelivery: CheckedContinuation<Void, Never>?
+
+    func attach(session: AudioPipelineSession) {
+        lock.withLock {
+            self.session = session
+        }
+    }
+
+    func receive(_ event: AudioEvent) async {
+        let shouldSpawnStop: Bool = lock.withLock {
+            events.append(event)
+            guard case .endpointFailed = event else { return false }
+            return recoveryStopTask == nil
+        }
+        if shouldSpawnStop {
+            let session = lock.withLock { self.session }
+            let task = Task { [weak self, weak session] in
+                await session?.stop()
+                self?.recordRecoveryStopComplete()
+            }
+            lock.withLock {
+                recoveryStopTask = task
+            }
+        }
+        let shouldSuspendTerminal: Bool = lock.withLock {
+            guard case .flowStopped = event,
+                  !hasSuspendedTerminalDelivery
+            else {
+                return false
+            }
+            hasSuspendedTerminalDelivery = true
+            return true
+        }
+        guard shouldSuspendTerminal else { return }
+        await withCheckedContinuation { continuation in
+            lock.withLock {
+                terminalDelivery = continuation
+            }
+        }
+    }
+
+    func values() -> [AudioEvent] {
+        lock.withLock { events }
+    }
+
+    func isRecoveryStopComplete() -> Bool {
+        lock.withLock { recoveryStopComplete }
+    }
+
+    func isTerminalDeliverySuspended() -> Bool {
+        lock.withLock { terminalDelivery != nil }
+    }
+
+    func resumeTerminalDelivery() {
+        let continuation: CheckedContinuation<Void, Never>? = lock.withLock {
+            let continuation = terminalDelivery
+            terminalDelivery = nil
+            return continuation
+        }
+        continuation?.resume()
+    }
+
+    func waitForRecoveryStop() async {
+        let task = lock.withLock { recoveryStopTask }
+        await task?.value
+    }
+
+    private func recordRecoveryStopComplete() {
+        lock.withLock {
+            recoveryStopComplete = true
+        }
     }
 }
 

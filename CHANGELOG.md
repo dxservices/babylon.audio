@@ -32,6 +32,8 @@ All notable changes to this project will be documented in this file.
 - Route receiver and sink failures through one downlink endpoint-failure
   lifecycle, serialize event delivery, and reject flow-identifier reuse within
   a pipeline-session instance.
+- Make caller stop a completion barrier across pending starts and terminal
+  delivery so immediate restart cannot race old-generation cleanup.
 - Add caller-driven external-frame fan-out to an external local monitor and
   bounded uplink sender, with serialized submission, flow isolation, snapshots,
   cancellation-aware admission, and atomic local-monitor or uplink failure
