@@ -42,6 +42,13 @@ struct AudioPipelineContractTests {
     @Test("Microphone policies are explicit microphone source choices")
     func microphonePoliciesAreSourceChoices() throws {
         let sender = RecordingSender()
+        let capture = try AudioCaptureSettings(
+            format: .monoPCM16(sampleRate: 24_000),
+            frameDuration: .milliseconds(20),
+            maximumBufferedDuration: .milliseconds(100),
+            maximumFramesPerCallback: 8,
+            maximumPendingCallbackCount: 4
+        )
         let policies: [AudioInputPolicy] = [
             .builtInMicrophoneRequired,
             .preferBuiltInAllowPrivateAccessoryDuplex,
@@ -49,15 +56,19 @@ struct AudioPipelineContractTests {
 
         for policy in policies {
             let configuration = try AudioPipelineConfiguration(
-                source: .microphone(policy: policy),
+                source: .microphone(AudioMicrophoneSourceConfiguration(
+                    inputPolicy: policy,
+                    capture: capture
+                )),
                 uplinkSender: sender
             )
-            guard case .microphone(let configuredPolicy) = configuration.source
+            guard case .microphone(let microphone) = configuration.source
             else {
                 Issue.record("Expected an explicit microphone source")
                 continue
             }
-            #expect(configuredPolicy == policy)
+            #expect(microphone.inputPolicy == policy)
+            #expect(microphone.capture == capture)
         }
     }
 

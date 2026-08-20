@@ -8,8 +8,22 @@ public enum DeviceOutputPolicy: Equatable, Sendable {
 }
 
 @available(iOS 18, macOS 13, *)
+public struct AudioMicrophoneSourceConfiguration: Equatable, Sendable {
+    public let inputPolicy: AudioInputPolicy
+    public let capture: AudioCaptureSettings
+
+    public init(
+        inputPolicy: AudioInputPolicy,
+        capture: AudioCaptureSettings
+    ) {
+        self.inputPolicy = inputPolicy
+        self.capture = capture
+    }
+}
+
+@available(iOS 18, macOS 13, *)
 public enum AudioSourceConfiguration: Sendable {
-    case microphone(policy: AudioInputPolicy)
+    case microphone(AudioMicrophoneSourceConfiguration)
     case externalFrames
     case external(any AudioFrameSource)
 }

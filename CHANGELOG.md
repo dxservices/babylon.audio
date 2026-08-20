@@ -34,6 +34,11 @@ All notable changes to this project will be documented in this file.
   shutdown.
 - Add active external-source fan-out with directional endpoint-end and failure
   events plus graceful source-end draining under bounded queue age policy.
+- Add microphone-source pipeline capture through an injected shared device
+  engine, with explicit flow-independent capture settings, normalized-format
+  validation, bounded uplink fan-out, and source-failure lifecycle handling.
+- Isolate capture ownership so stale frame/failure callbacks and old iOS
+  handoff drains cannot clear or stop a replacement capture.
 - Verify local monitor, uplink, and downlink composition under one pipeline
   session, flow identifier, and terminal lifecycle.
 - Add content-free streaming snapshots and diagnostics for queue duration,

@@ -109,10 +109,22 @@ half-duplex consumer; a full-duplex consumer requires a separate lifecycle
 decision before adoption. Pipeline endpoint events never carry underlying
 source, receiver, sender, or sink errors. Callers that need private debugging
 detail must observe or map errors inside their injected endpoint boundary.
-Microphone and device-sink plans remain explicit start-time errors. Later A5
-slices add their processor and format-normalization paths and wire microphone
-and private-device policies through the route controller and shared device
-engine.
+
+A microphone source now carries an explicit `AudioCaptureSettings` value for
+its normalized format, frame duration, callback work bound, buffered-duration
+bound, and handoff capacity. `AudioPipelineSession` materializes those settings
+with the active flow identifier and starts capture on one injected, already
+configured and running `AudioDeviceEngine`. Frames delivered by that engine are
+validated against the flow and requested normalized format before entering the
+same serialized local-monitor/uplink fan-out. Capture failure reports the
+content-free `.source` endpoint, while stop and replacement use capture
+ownership tokens so late frames or failures cannot stop a newer capture.
+
+This slice does not configure an audio session, select a route, enable voice
+processing, or start the engine. Those safety transitions remain caller-owned
+until the route/runtime orchestration slice lands. Device-sink plans still fail
+explicitly at start; fake-backed tests prove the normalized engine boundary,
+not physical microphone conversion on Simulator.
 
 The deterministic session suite also composes local monitor, uplink, and
 downlink in one configuration. Both source-driven branches observe the same
@@ -156,9 +168,9 @@ snapshot change continues observation up to the configured bound. If a private
 accessory input was successfully selected, that duplex profile disables early
 exit for the whole observation round so SCO setup gets the full window.
 
-Microphone selection is represented only by
-`AudioSourceConfiguration.microphone(policy:)`; caller-provided PCM uses
-`.externalFrames` or `.external`. Device playback is represented only by
+Microphone selection and capture bounds are represented by
+`AudioSourceConfiguration.microphone(AudioMicrophoneSourceConfiguration)`;
+caller-provided PCM uses `.externalFrames` or `.external`. Device playback is represented only by
 `AudioSinkConfiguration.device(policy: .privateOutputRequired)`. Omitting a
 device sink means that the pipeline has no device-output path; it never implies
 a speaker fallback.
@@ -220,6 +232,12 @@ converter validation completes synchronously before the tap is installed.
 Configuration also rejects a `maximumFramesPerCallback` that cannot cover every
 frame permitted by `maximumBufferedDuration`, so accepted callback sizes cannot
 later fail solely because the assembler work bound is smaller.
+
+Capture ownership is tokenized inside `AudioDeviceEngine`. A stale backend
+failure cannot clear a replacement capture's public state, and the iOS backend
+also checks the failed handoff bridge identity before removing a tap. This
+isolation is required because capture stop is intentionally not an async
+delivery barrier.
 
 `stopCapture()` removes the tap, closes the handoff, and requests drain-task
 cancellation, but it is not an async delivery barrier: an `onFrame` call already

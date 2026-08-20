@@ -5,23 +5,33 @@ public enum AudioPipelineSessionError: Error, Equatable, Sendable {
     case notRunning
     case externalFramesNotConfigured
     case frameFlowMismatch
-    case sourceDrivenPlanNotAvailable
     case deviceRuntimeRequired
+}
+
+@available(iOS 18, macOS 13, *)
+private struct PendingMicrophoneCaptureStart {
+    let generation: AudioFlowGeneration
+    let task: Task<AudioDeviceCaptureToken, any Error>
 }
 
 @available(iOS 18, macOS 13, *)
 public actor AudioPipelineSession {
     private let configuration: AudioPipelineConfiguration
+    private let deviceEngine: AudioDeviceEngine?
     private let uplink: BoundedUplinkQueue
     private let downlink: BoundedDownlinkJitterBuffer
     private let eventGate = AudioPipelineSerialGate()
     private let sourceGate = AudioPipelineSerialGate()
 
     private var activeGeneration: AudioFlowGeneration?
+    private var finishingGeneration: AudioFlowGeneration?
     private var sourceTask: Task<Void, Never>?
     private var receiverTask: Task<Void, Never>?
     private var naturalEndDirection: AudioDirection?
     private var observedNaturalEndDirections: Set<AudioDirection> = []
+    private var microphoneCaptureToken: AudioDeviceCaptureToken?
+    private var pendingMicrophoneCaptureStart:
+        PendingMicrophoneCaptureStart?
     private var state: AudioPipelineState = .idle
     private var usedFlowIDs: Set<AudioFlowID> = []
     private var activeLocalMonitorSink: (any AudioFrameSink)?
@@ -29,10 +39,12 @@ public actor AudioPipelineSession {
 
     public init(
         configuration: AudioPipelineConfiguration,
+        deviceEngine: AudioDeviceEngine? = nil,
         uplinkPolicy: BoundedUplinkQueuePolicy = .initial,
         downlinkPolicy: BoundedDownlinkJitterBufferPolicy = .initial
     ) {
         self.configuration = configuration
+        self.deviceEngine = deviceEngine
         uplink = BoundedUplinkQueue(
             policy: uplinkPolicy,
             diagnosticSink: configuration.diagnosticSink
@@ -76,20 +88,30 @@ public actor AudioPipelineSession {
     }
 
     public func start(flowID: AudioFlowID = AudioFlowID()) async throws {
-        guard activeGeneration == nil else {
+        guard activeGeneration == nil,
+              finishingGeneration == nil,
+              pendingMicrophoneCaptureStart == nil
+        else {
             throw AudioPipelineSessionError.alreadyRunning
         }
         guard !usedFlowIDs.contains(flowID) else {
             throw AudioPipelineSessionError.reusedFlowID
         }
         let activeSource: (any AudioFrameSource)?
+        let microphoneCapture: AudioCaptureSettings?
         switch configuration.source {
         case .external(let source):
             activeSource = source
+            microphoneCapture = nil
         case .externalFrames, nil:
             activeSource = nil
-        case .microphone:
-            throw AudioPipelineSessionError.sourceDrivenPlanNotAvailable
+            microphoneCapture = nil
+        case .microphone(let microphone):
+            guard deviceEngine != nil else {
+                throw AudioPipelineSessionError.deviceRuntimeRequired
+            }
+            activeSource = nil
+            microphoneCapture = microphone.capture
         }
 
         let localMonitorSink: (any AudioFrameSink)?
@@ -166,6 +188,14 @@ public actor AudioPipelineSession {
             }
         }
 
+        if let microphoneCapture {
+            try await startMicrophoneCapture(
+                microphoneCapture,
+                generation: generation
+            )
+            guard activeGeneration == generation else { return }
+        }
+
         guard let receiver = configuration.downlinkReceiver else { return }
         receiverTask = Task { [weak self] in
             do {
@@ -179,6 +209,85 @@ public actor AudioPipelineSession {
             } catch {
                 await self?.receiverFailed(error, generation: generation)
             }
+        }
+    }
+
+    private func startMicrophoneCapture(
+        _ settings: AudioCaptureSettings,
+        generation: AudioFlowGeneration
+    ) async throws {
+        guard let deviceEngine else {
+            throw AudioPipelineSessionError.deviceRuntimeRequired
+        }
+        let captureConfiguration = settings.resolve(flowID: generation.flowID)
+        let task = Task { @MainActor [deviceEngine] in
+            try deviceEngine.startCaptureOwned(
+                configuration: captureConfiguration,
+                onFrame: { [weak self] frame in
+                    await self?.receiveCapturedFrame(
+                        frame,
+                        expectedFormat: settings.format,
+                        generation: generation
+                    )
+                },
+                onFailure: { [weak self] _ in
+                    await self?.sourceFailed(generation: generation)
+                }
+            )
+        }
+        pendingMicrophoneCaptureStart = PendingMicrophoneCaptureStart(
+            generation: generation,
+            task: task
+        )
+        do {
+            let token = try await task.value
+            guard activeGeneration == generation else {
+                await deviceEngine.stopCapture(token: token)
+                clearPendingMicrophoneCaptureStart(generation: generation)
+                return
+            }
+            microphoneCaptureToken = token
+            clearPendingMicrophoneCaptureStart(generation: generation)
+        } catch {
+            clearPendingMicrophoneCaptureStart(generation: generation)
+            guard activeGeneration == generation else { throw error }
+            await finish(
+                generation: generation,
+                reason: .endpointFailure,
+                stopDownlink: true,
+                endpointDirection: .source
+            )
+            throw error
+        }
+    }
+
+    private func clearPendingMicrophoneCaptureStart(
+        generation: AudioFlowGeneration
+    ) {
+        guard pendingMicrophoneCaptureStart?.generation == generation else {
+            return
+        }
+        pendingMicrophoneCaptureStart = nil
+    }
+
+    private func receiveCapturedFrame(
+        _ frame: AudioFrame,
+        expectedFormat: AudioStreamFormat,
+        generation: AudioFlowGeneration
+    ) async {
+        guard activeGeneration == generation else { return }
+        guard frame.flowID == generation.flowID,
+              frame.format == expectedFormat
+        else {
+            await sourceFailed(generation: generation)
+            return
+        }
+        do {
+            try await deliverSourceFrame(frame, generation: generation)
+        } catch is CancellationError {
+            return
+        } catch {
+            await sourceFailed(generation: generation)
         }
     }
 
@@ -351,15 +460,30 @@ public actor AudioPipelineSession {
     ) async {
         guard activeGeneration == generation else { return }
         activeGeneration = nil
+        finishingGeneration = generation
         naturalEndDirection = nil
         state = .stopped
         let source = sourceTask
         sourceTask = nil
         let task = receiverTask
         receiverTask = nil
+        let captureToken = microphoneCaptureToken
+        microphoneCaptureToken = nil
+        let pendingCaptureStart = pendingMicrophoneCaptureStart.flatMap {
+            $0.generation == generation ? $0 : nil
+        }
         source?.cancel()
         task?.cancel()
         activeLocalMonitorSink = nil
+        if let captureToken {
+            await deviceEngine?.stopCapture(token: captureToken)
+        }
+        if let pendingCaptureStart,
+           case .success(let acquiredToken) = await pendingCaptureStart.task.result
+        {
+            await deviceEngine?.stopCapture(token: acquiredToken)
+        }
+        clearPendingMicrophoneCaptureStart(generation: generation)
         await uplink.stop()
         if stopDownlink {
             await downlink.stop()
@@ -373,6 +497,9 @@ public actor AudioPipelineSession {
         await emit(
             .flowStopped(flowID: generation.flowID, reason: reason)
         )
+        if finishingGeneration == generation {
+            finishingGeneration = nil
+        }
     }
 
     private func emit(_ event: AudioEvent) async {

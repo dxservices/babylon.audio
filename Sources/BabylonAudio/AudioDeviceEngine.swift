@@ -1,3 +1,5 @@
+import Foundation
+
 @available(iOS 18, macOS 13, *)
 public enum AudioDeviceEngineError: Error, Equatable, Sendable {
     case unsafeRoute
@@ -15,8 +17,7 @@ public enum AudioDeviceEngineError: Error, Equatable, Sendable {
 }
 
 @available(iOS 18, macOS 13, *)
-public struct AudioCaptureConfiguration: Equatable, Sendable {
-    public let flowID: AudioFlowID
+public struct AudioCaptureSettings: Equatable, Sendable {
     public let format: AudioStreamFormat
     public let frameDuration: Duration
     public let maximumBufferedDuration: Duration
@@ -24,7 +25,6 @@ public struct AudioCaptureConfiguration: Equatable, Sendable {
     public let maximumPendingCallbackCount: Int
 
     public init(
-        flowID: AudioFlowID,
         format: AudioStreamFormat,
         frameDuration: Duration,
         maximumBufferedDuration: Duration,
@@ -36,7 +36,7 @@ public struct AudioCaptureConfiguration: Equatable, Sendable {
         }
         do {
             _ = try AudioFrameAssembler(
-                flowID: flowID,
+                flowID: AudioFlowID(),
                 format: format,
                 frameDuration: frameDuration,
                 maximumBufferedDuration: maximumBufferedDuration,
@@ -62,7 +62,6 @@ public struct AudioCaptureConfiguration: Equatable, Sendable {
             throw AudioDeviceEngineError.invalidCaptureConfiguration
         }
 
-        self.flowID = flowID
         self.format = format
         self.frameDuration = frameDuration
         self.maximumBufferedDuration = maximumBufferedDuration
@@ -70,18 +69,11 @@ public struct AudioCaptureConfiguration: Equatable, Sendable {
         self.maximumPendingCallbackCount = maximumPendingCallbackCount
     }
 
-    func tapBufferFrameCapacity(sampleRate: Double) -> UInt32? {
-        Self.frameCapacity(duration: frameDuration, sampleRate: sampleRate)
+    func resolve(flowID: AudioFlowID) -> AudioCaptureConfiguration {
+        AudioCaptureConfiguration(flowID: flowID, settings: self)
     }
 
-    func maximumCallbackFrameCapacity(sampleRate: Double) -> UInt32? {
-        Self.frameCapacity(
-            duration: maximumBufferedDuration,
-            sampleRate: sampleRate
-        )
-    }
-
-    private static func frameCapacity(
+    fileprivate static func frameCapacity(
         duration: Duration,
         sampleRate: Double
     ) -> UInt32? {
@@ -101,12 +93,74 @@ public struct AudioCaptureConfiguration: Equatable, Sendable {
 }
 
 @available(iOS 18, macOS 13, *)
+public struct AudioCaptureConfiguration: Equatable, Sendable {
+    public let flowID: AudioFlowID
+    public let format: AudioStreamFormat
+    public let frameDuration: Duration
+    public let maximumBufferedDuration: Duration
+    public let maximumFramesPerCallback: Int
+    public let maximumPendingCallbackCount: Int
+
+    public init(flowID: AudioFlowID, settings: AudioCaptureSettings) {
+        self.flowID = flowID
+        format = settings.format
+        frameDuration = settings.frameDuration
+        maximumBufferedDuration = settings.maximumBufferedDuration
+        maximumFramesPerCallback = settings.maximumFramesPerCallback
+        maximumPendingCallbackCount = settings.maximumPendingCallbackCount
+    }
+
+    public init(
+        flowID: AudioFlowID,
+        format: AudioStreamFormat,
+        frameDuration: Duration,
+        maximumBufferedDuration: Duration,
+        maximumFramesPerCallback: Int,
+        maximumPendingCallbackCount: Int
+    ) throws {
+        self.init(
+            flowID: flowID,
+            settings: try AudioCaptureSettings(
+                format: format,
+                frameDuration: frameDuration,
+                maximumBufferedDuration: maximumBufferedDuration,
+                maximumFramesPerCallback: maximumFramesPerCallback,
+                maximumPendingCallbackCount: maximumPendingCallbackCount
+            )
+        )
+    }
+
+    func tapBufferFrameCapacity(sampleRate: Double) -> UInt32? {
+        AudioCaptureSettings.frameCapacity(
+            duration: frameDuration,
+            sampleRate: sampleRate
+        )
+    }
+
+    func maximumCallbackFrameCapacity(sampleRate: Double) -> UInt32? {
+        AudioCaptureSettings.frameCapacity(
+            duration: maximumBufferedDuration,
+            sampleRate: sampleRate
+        )
+    }
+}
+
+@available(iOS 18, macOS 13, *)
 public typealias AudioCaptureFrameHandler =
     @Sendable (_ frame: AudioFrame) async throws -> Void
 
 @available(iOS 18, macOS 13, *)
 public typealias AudioCaptureFailureHandler =
     @Sendable (_ error: any Error) async -> Void
+
+@available(iOS 18, macOS 13, *)
+struct AudioDeviceCaptureToken: Equatable, Sendable {
+    fileprivate let id: UUID
+
+    fileprivate init() {
+        id = UUID()
+    }
+}
 
 @available(iOS 18, macOS 13, *)
 @MainActor
@@ -143,6 +197,7 @@ public final class AudioDeviceEngine:
         AudioVoiceProcessingPolicy = .disabled
 
     private let backend: any AudioDeviceEngineBackend
+    private var activeCaptureToken: AudioDeviceCaptureToken?
 
     init(backend: any AudioDeviceEngineBackend) {
         self.backend = backend
@@ -189,6 +244,7 @@ public final class AudioDeviceEngine:
         guard isRunning else { return }
         muteOutput()
         backend.stop()
+        activeCaptureToken = nil
         isCapturing = false
         isRunning = false
     }
@@ -198,15 +254,31 @@ public final class AudioDeviceEngine:
         onFrame: @escaping AudioCaptureFrameHandler,
         onFailure: AudioCaptureFailureHandler? = nil
     ) throws {
+        _ = try startCaptureOwned(
+            configuration: configuration,
+            onFrame: onFrame,
+            onFailure: onFailure
+        )
+    }
+
+    @discardableResult
+    func startCaptureOwned(
+        configuration: AudioCaptureConfiguration,
+        onFrame: @escaping AudioCaptureFrameHandler,
+        onFailure: AudioCaptureFailureHandler? = nil
+    ) throws -> AudioDeviceCaptureToken {
         guard isRunning else {
             throw AudioDeviceEngineError.engineNotRunning
         }
         guard !isCapturing else {
             throw AudioDeviceEngineError.captureAlreadyRunning
         }
+        let token = AudioDeviceCaptureToken()
         let stateAwareFailureHandler: AudioCaptureFailureHandler = {
-            [weak self] error in
-            await self?.captureDidFail()
+            [weak self, token] error in
+            guard await self?.captureDidFail(token: token) == true else {
+                return
+            }
             await onFailure?(error)
         }
         try backend.startCapture(
@@ -214,7 +286,9 @@ public final class AudioDeviceEngine:
             onFrame: onFrame,
             onFailure: stateAwareFailureHandler
         )
+        activeCaptureToken = token
         isCapturing = true
+        return token
     }
 
     public func unmuteOutput(
@@ -235,8 +309,14 @@ public final class AudioDeviceEngine:
     }
 
     public func stopCapture() {
+        activeCaptureToken = nil
         backend.stopCapture()
         isCapturing = false
+    }
+
+    func stopCapture(token: AudioDeviceCaptureToken) {
+        guard activeCaptureToken == token else { return }
+        stopCapture()
     }
 
     public func stopPlayback() {
@@ -253,12 +333,16 @@ public final class AudioDeviceEngine:
         isRunning = false
         isOutputMuted = true
         isCapturing = false
+        activeCaptureToken = nil
         playbackFormat = nil
         voiceProcessingPolicy = .disabled
     }
 
-    private func captureDidFail() {
+    private func captureDidFail(token: AudioDeviceCaptureToken) -> Bool {
+        guard activeCaptureToken == token else { return false }
+        activeCaptureToken = nil
         isCapturing = false
+        return true
     }
 }
 
@@ -421,8 +505,12 @@ private final class AVAudioDeviceEngineBackend: AudioDeviceEngineBackend {
             } catch is CancellationError {
                 return
             } catch {
-                await self?.stopCaptureAfterFailure()
-                await onFailure?(error)
+                let ownedFailure = await self?.stopCaptureAfterFailure(
+                    bridge: bridge
+                ) ?? false
+                if ownedFailure {
+                    await onFailure?(error)
+                }
             }
         }
 
@@ -478,8 +566,12 @@ private final class AVAudioDeviceEngineBackend: AudioDeviceEngineBackend {
         playbackAVFormat = nil
     }
 
-    private func stopCaptureAfterFailure() {
+    private func stopCaptureAfterFailure(
+        bridge: BoundedAudioCaptureBridge
+    ) -> Bool {
+        guard captureBridge === bridge else { return false }
         stopCapture()
+        return true
     }
 
     private static func makeGraph() -> (

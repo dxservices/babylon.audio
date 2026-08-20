@@ -203,6 +203,34 @@ struct AudioDeviceEngineTests {
         #expect(!engine.isCapturing)
     }
 
+    @Test("A stale capture failure cannot clear replacement capture state")
+    func staleCaptureFailureCannotClearReplacementState() async throws {
+        let backend = RecordingDeviceEngineBackend()
+        let engine = AudioDeviceEngine(backend: backend)
+        let configuration = try makeCaptureConfiguration()
+        let failures = DeviceEngineFailureCounter()
+        try engine.start()
+        try engine.startCapture(
+            configuration: configuration,
+            onFrame: { _ in },
+            onFailure: { _ in await failures.increment() }
+        )
+        engine.stopCapture()
+        try engine.startCapture(
+            configuration: configuration,
+            onFrame: { _ in },
+            onFailure: { _ in await failures.increment() }
+        )
+
+        await backend.failCapture(at: 0)
+        #expect(engine.isCapturing)
+        #expect(await failures.value == 0)
+
+        await backend.failCapture(at: 1)
+        #expect(!engine.isCapturing)
+        #expect(await failures.value == 1)
+    }
+
     @Test("Output can only unmute after a safe route evaluation")
     func unmuteRequiresSafeRoute() throws {
         let backend = RecordingDeviceEngineBackend()
@@ -339,7 +367,7 @@ private final class RecordingDeviceEngineBackend: AudioDeviceEngineBackend {
     }
 
     private(set) var actions: [Action] = []
-    private var captureFailureHandler: AudioCaptureFailureHandler?
+    private var captureFailureHandlers: [AudioCaptureFailureHandler?] = []
     private var playbackContinuations:
         [UInt64: CheckedContinuation<Void, any Error>] = [:]
 
@@ -386,11 +414,16 @@ private final class RecordingDeviceEngineBackend: AudioDeviceEngineBackend {
         onFailure: AudioCaptureFailureHandler?
     ) throws {
         actions.append(.startCapture(configuration))
-        captureFailureHandler = onFailure
+        captureFailureHandlers.append(onFailure)
     }
 
     func failCapture() async {
-        await captureFailureHandler?(DeviceEngineTestError.captureFailed)
+        guard !captureFailureHandlers.isEmpty else { return }
+        await failCapture(at: captureFailureHandlers.count - 1)
+    }
+
+    func failCapture(at index: Int) async {
+        await captureFailureHandlers[index]?(DeviceEngineTestError.captureFailed)
     }
 
     func stopCapture() {
@@ -418,4 +451,12 @@ private final class RecordingDeviceEngineBackend: AudioDeviceEngineBackend {
 
 private enum DeviceEngineTestError: Error {
     case captureFailed
+}
+
+private actor DeviceEngineFailureCounter {
+    private(set) var value = 0
+
+    func increment() {
+        value += 1
+    }
 }
