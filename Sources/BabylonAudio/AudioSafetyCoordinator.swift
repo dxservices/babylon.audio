@@ -52,6 +52,16 @@ public enum AudioSafetyCoordinatorError: Error, Equatable, Sendable {
 }
 
 @available(iOS 18, macOS 13, *)
+public enum AudioPipelineSafetyBufferControllerError:
+    Error,
+    Equatable,
+    Sendable
+{
+    case replacementDuringSafetyBoundary
+    case supersededReplacement
+}
+
+@available(iOS 18, macOS 13, *)
 @MainActor
 public final class AudioSafetyConfigurationPermit {
     fileprivate weak var coordinator: AudioSafetyCoordinator?
@@ -117,24 +127,77 @@ public final class AudioStreamingSafetyBufferController:
 public final class AudioPipelineSafetyBufferController:
     AudioPendingAudioDiscarding
 {
-    private let session: AudioPipelineSession
-    private var latchedRevisions: [UInt64] = []
+    private struct SafetyClaim {
+        let session: AudioPipelineSession
+        let revision: UInt64
+    }
+
+    private var session: AudioPipelineSession
+    private var sessionRevision: UInt64 = 0
+    private var boundaryClaimRevision: UInt64 = 0
+    private var activeDiscardCount = 0
+    private var latchedClaims: [SafetyClaim] = []
 
     public init(session: AudioPipelineSession) {
         self.session = session
     }
 
+    /// Rebinds one retained coordinator to a replacement pipeline session.
+    ///
+    /// Replacement first awaits the old session's complete stop barrier. A
+    /// safety claim arriving while that barrier is suspended wins and causes
+    /// replacement to fail closed. Its later cleanup remains paired with the
+    /// exact old session and cannot stop or complete a newer session.
+    public func replaceSession(
+        _ replacement: AudioPipelineSession
+    ) async throws {
+        try Task.checkCancellation()
+        guard replacement !== session else { return }
+        guard activeDiscardCount == 0, latchedClaims.isEmpty else {
+            throw AudioPipelineSafetyBufferControllerError
+                .replacementDuringSafetyBoundary
+        }
+        let expectedSessionRevision = sessionRevision
+        let expectedBoundaryRevision = boundaryClaimRevision
+        let oldSession = session
+        await oldSession.stop()
+        try Task.checkCancellation()
+        guard activeDiscardCount == 0,
+              latchedClaims.isEmpty,
+              boundaryClaimRevision == expectedBoundaryRevision
+        else {
+            throw AudioPipelineSafetyBufferControllerError
+                .replacementDuringSafetyBoundary
+        }
+        guard sessionRevision == expectedSessionRevision,
+              session === oldSession
+        else {
+            throw AudioPipelineSafetyBufferControllerError
+                .supersededReplacement
+        }
+        session = replacement
+        precondition(sessionRevision < UInt64.max)
+        sessionRevision += 1
+    }
+
     public func latchSafetyBoundary() {
-        latchedRevisions.append(session.latchSafetyBoundary())
+        precondition(boundaryClaimRevision < UInt64.max)
+        boundaryClaimRevision += 1
+        latchedClaims.append(SafetyClaim(
+            session: session,
+            revision: session.latchSafetyBoundary()
+        ))
     }
 
     public func discardPendingAudio() async {
-        if latchedRevisions.isEmpty {
+        if latchedClaims.isEmpty {
             latchSafetyBoundary()
         }
-        let revision = latchedRevisions.removeFirst()
-        await session.stopForSafetyBoundary()
-        session.completeSafetyBoundary(revision: revision)
+        let claim = latchedClaims.removeFirst()
+        activeDiscardCount += 1
+        defer { activeDiscardCount -= 1 }
+        await claim.session.stopForSafetyBoundary()
+        claim.session.completeSafetyBoundary(revision: claim.revision)
     }
 }
 

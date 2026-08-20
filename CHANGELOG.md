@@ -77,6 +77,13 @@ All notable changes to this project will be documented in this file.
   stop callbacks, awaits pending start/capture attempts plus playback and queue
   cleanup, resets source processing state, and tolerates idempotent hardware-
   stop duplication before session deactivation and device-event delivery.
+- Allow that safety-buffer adapter to rebind one retained coordinator to an
+  immutable replacement pipeline only after the old terminal barrier, while
+  exact-session safety claims and monotonic replacement identity make boundary
+  races and concurrent replacement fail closed. Caller cancellation still
+  awaits complete old-session cleanup and never binds the replacement; because
+  the old session may already be stopped, retry requires fresh caller identity
+  validation.
 - Gate recovery and public output unmute with operation-scoped monotonic
   configuration permits, revoke permits when their configuration closure exits,
   and invalidate suspended or superseded queued recovery work as soon as a

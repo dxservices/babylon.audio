@@ -272,6 +272,21 @@ Because the coordinator has already stopped the shared hardware by the cleanup
 phase, the session may issue the same capture or playback stop again; the shared
 engine's ownership checks and stop operations make that duplication safe and
 prevent stale callbacks from reviving an old generation.
+
+A consumer that rebuilds immutable pipeline configurations may retain the same
+coordinator and call `await buffers.replaceSession(replacement)`. Replacement
+first awaits the old session's full stop and event-delivery barrier. It fails
+closed if a safety boundary is latched or cleaned up during that suspension, or
+if another replacement wins. Every safety claim records the exact session and
+session-local revision it latched, so late cleanup from an old session cannot
+stop or complete the replacement. Do not retry until the winning boundary has
+finished and the caller has revalidated its current route and operation
+identity.
+Caller cancellation is checked before replacement begins and again only after
+the old terminal/cleanup barrier has completed. A cancelled caller never binds
+the replacement session, although the old session may already be stopped; the
+caller must revalidate current operation identity and explicitly retry if the
+replacement is still desired.
 These ordering and race guarantees are covered with deterministic backends;
 they are not physical-iPhone route or media-reset acceptance evidence.
 

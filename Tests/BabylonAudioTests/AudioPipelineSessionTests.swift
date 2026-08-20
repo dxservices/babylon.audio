@@ -1163,6 +1163,229 @@ struct AudioPipelineSessionTests {
         await session.stop()
     }
 
+    @Test("Safety buffer replacement stops old session and binds future claims to new session")
+    func safetyBufferReplacementMovesExactSessionOwnership() async throws {
+        let oldFlowID = AudioFlowID()
+        let replacementFlowID = AudioFlowID()
+        let oldEvents = SessionRecordingEventSink()
+        let replacementEvents = SessionRecordingEventSink()
+        let oldSession = AudioPipelineSession(
+            configuration: try AudioPipelineConfiguration(
+                source: .externalFrames,
+                uplinkSender: SessionRecordingSender(),
+                eventSink: oldEvents
+            )
+        )
+        let replacementSession = AudioPipelineSession(
+            configuration: try AudioPipelineConfiguration(
+                source: .externalFrames,
+                uplinkSender: SessionRecordingSender(),
+                eventSink: replacementEvents
+            )
+        )
+        let safetyBuffers = await MainActor.run {
+            AudioPipelineSafetyBufferController(session: oldSession)
+        }
+
+        try await oldSession.start(flowID: oldFlowID)
+        try await safetyBuffers.replaceSession(replacementSession)
+        #expect(await oldSession.snapshot.state == .stopped)
+        #expect(await oldEvents.values() == [
+            .flowStarted(flowID: oldFlowID),
+            .flowStopped(flowID: oldFlowID, reason: .consumerRequested),
+        ])
+
+        try await replacementSession.start(flowID: replacementFlowID)
+        await safetyBuffers.discardPendingAudio()
+        #expect(await replacementSession.snapshot.state == .stopped)
+        #expect(await replacementEvents.values() == [
+            .flowStarted(flowID: replacementFlowID),
+            .flowStopped(flowID: replacementFlowID, reason: .safetyBoundary),
+        ])
+    }
+
+    @Test("Safety claim racing replacement stays paired with old session and fails replacement closed")
+    func safetyClaimWinsSuspendedSessionReplacement() async throws {
+        let oldFlowID = AudioFlowID()
+        let replacementFlowID = AudioFlowID()
+        let oldEvents = SessionSuspendingEventSink(suspendingAt: 2)
+        let replacementEvents = SessionRecordingEventSink()
+        let oldSession = AudioPipelineSession(
+            configuration: try AudioPipelineConfiguration(
+                source: .externalFrames,
+                uplinkSender: SessionRecordingSender(),
+                eventSink: oldEvents
+            )
+        )
+        let replacementSession = AudioPipelineSession(
+            configuration: try AudioPipelineConfiguration(
+                source: .externalFrames,
+                uplinkSender: SessionRecordingSender(),
+                eventSink: replacementEvents
+            )
+        )
+        let safetyBuffers = await MainActor.run {
+            AudioPipelineSafetyBufferController(session: oldSession)
+        }
+        try await oldSession.start(flowID: oldFlowID)
+
+        let replacement = Task {
+            try await safetyBuffers.replaceSession(replacementSession)
+        }
+        #expect(await eventuallySession {
+            oldEvents.values() == [
+                .flowStarted(flowID: oldFlowID),
+                .flowStopped(
+                    flowID: oldFlowID,
+                    reason: .consumerRequested
+                ),
+            ] && oldEvents.isSuspended()
+        })
+        await MainActor.run {
+            safetyBuffers.latchSafetyBoundary()
+        }
+        let cleanup = Task {
+            await safetyBuffers.discardPendingAudio()
+        }
+        oldEvents.resumeSuspendedDelivery()
+
+        await #expect(
+            throws: AudioPipelineSafetyBufferControllerError
+                .replacementDuringSafetyBoundary
+        ) {
+            try await replacement.value
+        }
+        await cleanup.value
+
+        try await replacementSession.start(flowID: replacementFlowID)
+        await safetyBuffers.discardPendingAudio()
+        #expect(await replacementSession.snapshot.state == .running)
+        await replacementSession.stop()
+    }
+
+    @Test("Concurrent safety-buffer replacements elect one session and supersede the loser")
+    func concurrentSafetyBufferReplacementFailsClosed() async throws {
+        let oldFlowID = AudioFlowID()
+        let firstFlowID = AudioFlowID()
+        let secondFlowID = AudioFlowID()
+        let oldEvents = SessionSuspendingEventSink(suspendingAt: 2)
+        let stopWaitObservation = SessionStopWaitObservation()
+        let firstSession = AudioPipelineSession(
+            configuration: try AudioPipelineConfiguration(
+                source: .externalFrames,
+                uplinkSender: SessionRecordingSender()
+            )
+        )
+        let secondSession = AudioPipelineSession(
+            configuration: try AudioPipelineConfiguration(
+                source: .externalFrames,
+                uplinkSender: SessionRecordingSender()
+            )
+        )
+        let oldSession = AudioPipelineSession(
+            configuration: try AudioPipelineConfiguration(
+                source: .externalFrames,
+                uplinkSender: SessionRecordingSender(),
+                eventSink: oldEvents
+            ),
+            startAttemptSuspension: {},
+            stopWaitObservation: {
+                stopWaitObservation.record()
+            }
+        )
+        let safetyBuffers = await MainActor.run {
+            AudioPipelineSafetyBufferController(session: oldSession)
+        }
+        try await oldSession.start(flowID: oldFlowID)
+
+        let firstReplacement = Task {
+            do {
+                try await safetyBuffers.replaceSession(firstSession)
+                return nil as AudioPipelineSafetyBufferControllerError?
+            } catch {
+                return error as? AudioPipelineSafetyBufferControllerError
+            }
+        }
+        #expect(await eventuallySession { oldEvents.isSuspended() })
+        let secondReplacement = Task {
+            do {
+                try await safetyBuffers.replaceSession(secondSession)
+                return nil as AudioPipelineSafetyBufferControllerError?
+            } catch {
+                return error as? AudioPipelineSafetyBufferControllerError
+            }
+        }
+        await stopWaitObservation.waitUntilCount(1)
+        oldEvents.resumeSuspendedDelivery()
+
+        let results = await [
+            firstReplacement.value,
+            secondReplacement.value,
+        ]
+        #expect(results.filter { $0 == nil }.count == 1)
+        #expect(results.filter { $0 == .supersededReplacement }.count == 1)
+
+        try await firstSession.start(flowID: firstFlowID)
+        try await secondSession.start(flowID: secondFlowID)
+        await safetyBuffers.discardPendingAudio()
+        let states = await [
+            firstSession.snapshot.state,
+            secondSession.snapshot.state,
+        ]
+        #expect(states.filter { $0 == .stopped }.count == 1)
+        #expect(states.filter { $0 == .running }.count == 1)
+        await firstSession.stop()
+        await secondSession.stop()
+    }
+
+    @Test("Cancelled replacement waits for old cleanup and never binds the replacement")
+    func cancelledSafetyBufferReplacementDoesNotBind() async throws {
+        let oldFlowID = AudioFlowID()
+        let replacementFlowID = AudioFlowID()
+        let oldEvents = SessionSuspendingEventSink(suspendingAt: 2)
+        let oldSession = AudioPipelineSession(
+            configuration: try AudioPipelineConfiguration(
+                source: .externalFrames,
+                uplinkSender: SessionRecordingSender(),
+                eventSink: oldEvents
+            )
+        )
+        let replacementSession = AudioPipelineSession(
+            configuration: try AudioPipelineConfiguration(
+                source: .externalFrames,
+                uplinkSender: SessionRecordingSender()
+            )
+        )
+        let safetyBuffers = await MainActor.run {
+            AudioPipelineSafetyBufferController(session: oldSession)
+        }
+        try await oldSession.start(flowID: oldFlowID)
+
+        let replacement = Task {
+            try await safetyBuffers.replaceSession(replacementSession)
+        }
+        #expect(await eventuallySession {
+            oldEvents.values() == [
+                .flowStarted(flowID: oldFlowID),
+                .flowStopped(
+                    flowID: oldFlowID,
+                    reason: .consumerRequested
+                ),
+            ] && oldEvents.isSuspended()
+        })
+        replacement.cancel()
+        oldEvents.resumeSuspendedDelivery()
+
+        await #expect(throws: CancellationError.self) {
+            try await replacement.value
+        }
+
+        try await replacementSession.start(flowID: replacementFlowID)
+        await safetyBuffers.discardPendingAudio()
+        #expect(await replacementSession.snapshot.state == .running)
+        await replacementSession.stop()
+    }
+
     @Test("Safety cleanup blocks replacement and resets source processing")
     func safetyCleanupOwnsTerminalBarrierAndProcessorReset() async throws {
         let firstFlowID = AudioFlowID()
@@ -1638,6 +1861,10 @@ struct AudioPipelineSessionTests {
         #expect(await eventuallySession {
             await session.snapshot.state == .stopped
         })
+        // The observable state can become stopped just before the terminal
+        // run-cleanup barrier releases `activeRun`; join that barrier before
+        // exercising identifier reuse.
+        await session.stop()
 
         await #expect(throws: AudioPipelineSessionError.reusedFlowID) {
             try await session.start(flowID: flowID)
