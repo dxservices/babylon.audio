@@ -24,6 +24,27 @@ struct AudioPipelineContractTests {
         }
     }
 
+    @Test("A source-side processor cannot be attached to a downlink-only plan")
+    func processorRequiresASource() throws {
+        let chain = try AudioFrameProcessorChain(
+            processors: [],
+            budget: .init(
+                maximumAlgorithmicWindow: .zero,
+                maximumInternalBufferDuration: .zero,
+                maximumOutputFrameCountPerInput: 1,
+                maximumProcessingDuration: .milliseconds(1)
+            )
+        )
+
+        #expect(throws: AudioContractError.sourceRequired) {
+            try AudioPipelineConfiguration(
+                sourceProcessorChain: chain,
+                downlinkReceiver: FixedReceiver(frames: []),
+                downlinkSink: .external(RecordingSink())
+            )
+        }
+    }
+
     @Test("External frames are modeled as a source, not a microphone policy")
     func externalFramesAreASource() throws {
         let sender = RecordingSender()

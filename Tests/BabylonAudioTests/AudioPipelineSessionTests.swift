@@ -918,6 +918,222 @@ struct AudioPipelineSessionTests {
         })
     }
 
+    @Test("A processor can drop or expand source frames before fan-out")
+    func processorOutputsReachEverySourcePlanInOrder() async throws {
+        let flowID = AudioFlowID()
+        let dropped = try makeSessionFrame(flowID: flowID, sequence: 0)
+        let expanded = try makeSessionFrame(flowID: flowID, sequence: 1)
+        let monitor = SessionRecordingSink()
+        let sender = SessionRecordingSender()
+        let chain = try makeSessionProcessorChain([
+            SessionDropOrDuplicateProcessor(),
+        ])
+        let configuration = try AudioPipelineConfiguration(
+            source: .externalFrames,
+            sourceProcessorChain: chain,
+            localMonitorSink: .external(monitor),
+            uplinkSender: sender
+        )
+        let session = AudioPipelineSession(configuration: configuration)
+
+        try await session.start(flowID: flowID)
+        try await session.submit(dropped)
+        try await session.submit(expanded)
+
+        #expect(await eventuallySession {
+            let expectedSequences: [UInt64] = [1, 101]
+            return await monitor.values().map(\.sequence) == expectedSequences
+                && sender.values().map(\.sequence) == expectedSequences
+        })
+        await session.stop()
+    }
+
+    @Test("Caller submission preserves processor errors and fails the source endpoint")
+    func callerSubmissionPreservesProcessorFailure() async throws {
+        let flowID = AudioFlowID()
+        let events = SessionRecordingEventSink()
+        let chain = try makeSessionProcessorChain([
+            SessionFailingProcessor(),
+        ])
+        let configuration = try AudioPipelineConfiguration(
+            source: .externalFrames,
+            sourceProcessorChain: chain,
+            localMonitorSink: .external(SessionRecordingSink()),
+            eventSink: events
+        )
+        let session = AudioPipelineSession(configuration: configuration)
+
+        try await session.start(flowID: flowID)
+        do {
+            try await session.submit(
+                try makeSessionFrame(flowID: flowID, sequence: 0)
+            )
+            Issue.record("Expected processor failure")
+        } catch let failure as AudioProcessorFailure {
+            #expect(failure.index == 0)
+            #expect(failure.underlyingError is SessionProcessorError)
+        } catch {
+            Issue.record("Expected AudioProcessorFailure, got \(type(of: error))")
+        }
+
+        #expect(await events.values() == [
+            .flowStarted(flowID: flowID),
+            .endpointFailed(flowID: flowID, direction: .source),
+            .flowStopped(flowID: flowID, reason: .endpointFailure),
+        ])
+        #expect(await session.snapshot.state == .stopped)
+    }
+
+    @Test("Caller submission preserves processor contract errors")
+    func callerSubmissionPreservesProcessingError() async throws {
+        let flowID = AudioFlowID()
+        let events = SessionRecordingEventSink()
+        let chain = try makeSessionProcessorChain([
+            SessionUndeclaredFormatProcessor(),
+        ])
+        let configuration = try AudioPipelineConfiguration(
+            source: .externalFrames,
+            sourceProcessorChain: chain,
+            localMonitorSink: .external(SessionRecordingSink()),
+            eventSink: events
+        )
+        let session = AudioPipelineSession(configuration: configuration)
+
+        try await session.start(flowID: flowID)
+        await #expect(throws: AudioProcessingError.unexpectedOutputFormat(
+            index: 0
+        )) {
+            try await session.submit(
+                try makeSessionFrame(flowID: flowID, sequence: 0)
+            )
+        }
+        #expect(await events.values() == [
+            .flowStarted(flowID: flowID),
+            .endpointFailed(flowID: flowID, direction: .source),
+            .flowStopped(flowID: flowID, reason: .endpointFailure),
+        ])
+    }
+
+    @Test("Active external-source processing failure stays content-free")
+    func externalSourceProcessorFailureUsesSourceLifecycle() async throws {
+        let flowID = AudioFlowID()
+        let frame = try makeSessionFrame(flowID: flowID, sequence: 0)
+        let events = SessionRecordingEventSink()
+        let configuration = try AudioPipelineConfiguration(
+            source: .external(SessionFixedSource(frames: [frame])),
+            sourceProcessorChain: makeSessionProcessorChain([
+                SessionFailingProcessor(),
+            ]),
+            localMonitorSink: .external(SessionRecordingSink()),
+            eventSink: events
+        )
+        let session = AudioPipelineSession(configuration: configuration)
+
+        try await session.start(flowID: flowID)
+        #expect(await eventuallySession {
+            await events.values() == [
+                .flowStarted(flowID: flowID),
+                .endpointFailed(flowID: flowID, direction: .source),
+                .flowStopped(flowID: flowID, reason: .endpointFailure),
+            ]
+        })
+    }
+
+    @Test("Microphone processing failure stops capture without exposing its error")
+    @MainActor
+    func microphoneProcessorFailureUsesSourceLifecycle() async throws {
+        let flowID = AudioFlowID()
+        let backend = SessionDeviceEngineBackend()
+        let engine = AudioDeviceEngine(backend: backend)
+        let events = SessionRecordingEventSink()
+        try engine.start()
+        let configuration = try AudioPipelineConfiguration(
+            source: .microphone(AudioMicrophoneSourceConfiguration(
+                inputPolicy: .builtInMicrophoneRequired,
+                capture: makeSessionCaptureSettings()
+            )),
+            sourceProcessorChain: makeSessionProcessorChain([
+                SessionFailingProcessor(),
+            ]),
+            uplinkSender: SessionRecordingSender(),
+            eventSink: events
+        )
+        let session = AudioPipelineSession(
+            configuration: configuration,
+            deviceEngine: engine
+        )
+
+        try await session.start(flowID: flowID)
+        try await backend.deliverCapture(
+            makeSessionFrame(flowID: flowID, sequence: 0),
+            at: 0
+        )
+        #expect(await eventuallySession {
+            await events.values() == [
+                .flowStarted(flowID: flowID),
+                .endpointFailed(flowID: flowID, direction: .source),
+                .flowStopped(flowID: flowID, reason: .endpointFailure),
+            ]
+        })
+        #expect(backend.stopCaptureCount == 1)
+        #expect(engine.isRunning)
+    }
+
+    @Test("Microphone processing resets per flow and declares device output format")
+    @MainActor
+    func microphoneProcessorFeedsSharedDeviceAndResets() async throws {
+        let firstFlowID = AudioFlowID()
+        let secondFlowID = AudioFlowID()
+        let outputFormat = try AudioStreamFormat.monoPCM16(sampleRate: 16_000)
+        let backend = SessionDeviceEngineBackend()
+        let engine = AudioDeviceEngine(backend: backend)
+        try engine.configurePlayback(format: outputFormat)
+        try engine.start()
+        let chain = try makeSessionProcessorChain([
+            SessionPairFormatProcessor(outputFormat: outputFormat),
+        ])
+        let configuration = try AudioPipelineConfiguration(
+            source: .microphone(AudioMicrophoneSourceConfiguration(
+                inputPolicy: .builtInMicrophoneRequired,
+                capture: makeSessionCaptureSettings()
+            )),
+            sourceProcessorChain: chain,
+            localMonitorSink: .device(policy: .privateOutputRequired)
+        )
+        let session = AudioPipelineSession(
+            configuration: configuration,
+            deviceEngine: engine
+        )
+
+        try await session.start(flowID: firstFlowID)
+        try await backend.deliverCapture(
+            makeSessionFrame(flowID: firstFlowID, sequence: 1),
+            at: 0
+        )
+        for _ in 0..<10 { await Task.yield() }
+        #expect(backend.playbackSequences.isEmpty)
+        await session.stop()
+
+        try await session.start(flowID: secondFlowID)
+        try await backend.deliverCapture(
+            makeSessionFrame(flowID: secondFlowID, sequence: 2),
+            at: 1
+        )
+        for _ in 0..<10 { await Task.yield() }
+        #expect(backend.playbackSequences.isEmpty)
+        try await backend.deliverCapture(
+            makeSessionFrame(flowID: secondFlowID, sequence: 3),
+            at: 1
+        )
+        #expect(await eventuallySession {
+            await backend.playbackSequences == [3]
+        })
+        await session.stop()
+        #expect(backend.stopCaptureCount == 2)
+        #expect(backend.stopPlaybackCount == 2)
+        #expect(engine.isRunning)
+    }
+
     @Test("A session rejects reuse of a completed flow identifier")
     func completedFlowIdentifierCannotBeReused() async throws {
         let flowID = AudioFlowID()
@@ -1333,6 +1549,140 @@ private struct SessionFailingSink: AudioFrameSink {
 }
 
 private enum SessionSinkError: Error, Equatable {
+    case failed
+}
+
+private let sessionProcessorBudget = AudioProcessorBudget(
+    maximumAlgorithmicWindow: .milliseconds(40),
+    maximumInternalBufferDuration: .milliseconds(80),
+    maximumOutputFrameCountPerInput: 4,
+    maximumProcessingDuration: .seconds(1)
+)
+
+private func makeSessionProcessorChain(
+    _ processors: [any AudioFrameProcessor]
+) throws -> AudioFrameProcessorChain {
+    try AudioFrameProcessorChain(
+        processors: processors,
+        budget: sessionProcessorBudget
+    )
+}
+
+private struct SessionDropOrDuplicateProcessor: AudioFrameProcessor {
+    let declaration = AudioFrameProcessorDeclaration(
+        algorithmicWindow: .zero,
+        maximumInternalBufferDuration: .zero,
+        maximumOutputFrameCount: 2,
+        formatBehavior: .preservesInput,
+        retainsSensitiveState: false
+    )
+
+    mutating func process(
+        _ frame: AudioFrame,
+        emit: @Sendable (AudioFrame) -> Void
+    ) throws {
+        guard frame.sequence != 0 else { return }
+        emit(frame)
+        emit(try AudioFrame(
+            flowID: frame.flowID,
+            sequence: frame.sequence + 100,
+            timestamp: frame.timestamp,
+            format: frame.format,
+            payload: frame.payload,
+            duration: frame.duration
+        ))
+    }
+
+    mutating func reset() {}
+}
+
+private struct SessionFailingProcessor: AudioFrameProcessor {
+    let declaration = AudioFrameProcessorDeclaration(
+        algorithmicWindow: .zero,
+        maximumInternalBufferDuration: .zero,
+        maximumOutputFrameCount: 1,
+        formatBehavior: .preservesInput,
+        retainsSensitiveState: false
+    )
+
+    mutating func process(
+        _ frame: AudioFrame,
+        emit: @Sendable (AudioFrame) -> Void
+    ) throws {
+        throw SessionProcessorError.failed
+    }
+
+    mutating func reset() {}
+}
+
+private struct SessionUndeclaredFormatProcessor: AudioFrameProcessor {
+    let declaration = AudioFrameProcessorDeclaration(
+        algorithmicWindow: .zero,
+        maximumInternalBufferDuration: .zero,
+        maximumOutputFrameCount: 1,
+        formatBehavior: .preservesInput,
+        retainsSensitiveState: false
+    )
+
+    mutating func process(
+        _ frame: AudioFrame,
+        emit: @Sendable (AudioFrame) -> Void
+    ) throws {
+        let format = try AudioStreamFormat.monoPCM16(sampleRate: 16_000)
+        emit(try AudioFrame(
+            flowID: frame.flowID,
+            sequence: frame.sequence,
+            timestamp: frame.timestamp,
+            format: format,
+            payload: Data(count: 640),
+            duration: frame.duration
+        ))
+    }
+
+    mutating func reset() {}
+}
+
+private struct SessionPairFormatProcessor: AudioFrameProcessor {
+    let declaration: AudioFrameProcessorDeclaration
+    private let outputFormat: AudioStreamFormat
+    private var hasBufferedFrame = false
+
+    init(outputFormat: AudioStreamFormat) {
+        self.outputFormat = outputFormat
+        declaration = AudioFrameProcessorDeclaration(
+            algorithmicWindow: .milliseconds(40),
+            maximumInternalBufferDuration: .milliseconds(20),
+            maximumOutputFrameCount: 1,
+            formatBehavior: .changesTo(outputFormat),
+            retainsSensitiveState: true
+        )
+    }
+
+    mutating func process(
+        _ frame: AudioFrame,
+        emit: @Sendable (AudioFrame) -> Void
+    ) throws {
+        guard hasBufferedFrame else {
+            hasBufferedFrame = true
+            return
+        }
+        hasBufferedFrame = false
+        emit(try AudioFrame(
+            flowID: frame.flowID,
+            sequence: frame.sequence,
+            timestamp: frame.timestamp,
+            format: outputFormat,
+            payload: Data(count: 640),
+            duration: frame.duration
+        ))
+    }
+
+    mutating func reset() {
+        hasBufferedFrame = false
+    }
+}
+
+private enum SessionProcessorError: Error {
     case failed
 }
 

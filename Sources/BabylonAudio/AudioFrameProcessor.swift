@@ -183,6 +183,20 @@ public struct AudioFrameProcessorChain: Sendable {
         }
     }
 
+    /// Resolves the final format declared by the chain without processing audio.
+    public func outputFormat(
+        for inputFormat: AudioStreamFormat
+    ) -> AudioStreamFormat {
+        processors.reduce(inputFormat) { currentFormat, processor in
+            switch processor.declaration.formatBehavior {
+            case .preservesInput:
+                currentFormat
+            case .changesTo(let outputFormat):
+                outputFormat
+            }
+        }
+    }
+
     private static func matches(
         _ outputFormat: AudioStreamFormat,
         inputFormat: AudioStreamFormat,

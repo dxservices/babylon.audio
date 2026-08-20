@@ -37,6 +37,7 @@ public enum AudioSinkConfiguration: Sendable {
 @available(iOS 18, macOS 13, *)
 public struct AudioPipelineConfiguration: Sendable {
     public let source: AudioSourceConfiguration?
+    public let sourceProcessorChain: AudioFrameProcessorChain?
     public let localMonitorSink: AudioSinkConfiguration?
     public let uplinkSender: (any AudioFrameSender)?
     public let downlinkReceiver: (any AudioFrameReceiver)?
@@ -46,6 +47,7 @@ public struct AudioPipelineConfiguration: Sendable {
 
     public init(
         source: AudioSourceConfiguration? = nil,
+        sourceProcessorChain: AudioFrameProcessorChain? = nil,
         localMonitorSink: AudioSinkConfiguration? = nil,
         uplinkSender: (any AudioFrameSender)? = nil,
         downlinkReceiver: (any AudioFrameReceiver)? = nil,
@@ -63,6 +65,9 @@ public struct AudioPipelineConfiguration: Sendable {
         guard !hasSourceDrivenPlan || source != nil else {
             throw AudioContractError.sourceRequired
         }
+        guard sourceProcessorChain == nil || source != nil else {
+            throw AudioContractError.sourceRequired
+        }
         guard source == nil || hasSourceDrivenPlan else {
             throw AudioContractError.unusedSource
         }
@@ -70,6 +75,7 @@ public struct AudioPipelineConfiguration: Sendable {
             throw AudioContractError.incompleteDownlink
         }
         self.source = source
+        self.sourceProcessorChain = sourceProcessorChain
         self.localMonitorSink = localMonitorSink
         self.uplinkSender = uplinkSender
         self.downlinkReceiver = downlinkReceiver

@@ -10,6 +10,10 @@ All notable changes to this project will be documented in this file.
   chains, and PCM conversion across the supported format matrix.
 - Preserve caller-owned processor failures without logging or stringifying
   their underlying errors.
+- Run an optional bounded `sourceProcessorChain` serially before source-side
+  fan-out, preserve zero/one/many output order, reset state across flow
+  generations, and preflight device playback against the chain's declared
+  final format.
 - Keep resampling state flow-scoped across adjacent frames and require an
   explicit reset on stop, replacement, or input-format change.
 - Remove policy cases that duplicated external-frame sources and absent sinks,

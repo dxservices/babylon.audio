@@ -120,6 +120,16 @@ same serialized local-monitor/uplink fan-out. Capture failure reports the
 content-free `.source` endpoint, while stop and replacement use capture
 ownership tokens so late frames or failures cannot stop a newer capture.
 
+Source-driven plans may inject one bounded `sourceProcessorChain`. The session
+runs its `AudioFrameProcessorChain` synchronously and serially before local-
+monitor and uplink fan-out, preserving the chain's zero-, one-, or many-frame
+output order. The chain is reset at each flow start and finish so retained state
+cannot cross a generation boundary. Processor failures terminate the shared
+flow through the content-free `.source` endpoint lifecycle. Caller-driven
+`submit` additionally rethrows the exact `AudioProcessorFailure` or
+`AudioProcessingError` for local API debugging; active external and microphone
+sources do not expose the underlying error through events.
+
 This slice does not configure an audio session, select a route, enable voice
 processing, or start the engine. Those safety transitions remain caller-owned
 until the route/runtime orchestration slice lands. Fake-backed tests prove the
@@ -129,14 +139,16 @@ Local-monitor and downlink `.device` sinks resolve to that same injected
 `AudioDeviceEngine`; the session never creates a second graph. Device playback
 requires the shared engine to be running with one exact format configured
 before start. A microphone-to-device local monitor additionally requires that
-format to match its normalized capture format. Natural downlink completion
+format to match the processor chain's declared final output format, or the
+normalized capture format when no chain is present. Natural downlink completion
 drains eligible accepted frames through the data-consumed scheduling boundary,
 not audible completion, before terminal delivery. Consumer stop, failure, or
 stopping a flow before starting its replacement stops device playback to
 release pending consumes, but leaves the shared engine running for the external
 safety/runtime owner. This shared-engine wiring does not by itself prove a safe
-private route or physical playback; route evaluation and output unmute remain
-the runtime owner's fail-closed responsibility.
+private route, physical microphone capture, or physical playback; route
+evaluation and output unmute remain the runtime owner's fail-closed
+responsibility.
 
 The deterministic session suite also composes local monitor, uplink, and
 downlink in one configuration. Both source-driven branches observe the same

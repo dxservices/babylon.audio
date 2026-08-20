@@ -90,6 +90,9 @@ struct AudioFrameProcessorChainTests {
         #expect(throws: AudioProcessingError.unexpectedOutputFormat(index: 0)) {
             try formatLiar.process(frame)
         }
+        #expect(
+            formatChanger.outputFormat(for: frame.format).sampleRate == 16_000
+        )
         #expect(try formatChanger.process(frame).first?.format.sampleRate == 16_000)
     }
 

@@ -37,6 +37,7 @@ public actor AudioPipelineSession {
     private var activeLocalMonitorSink: (any AudioFrameSink)?
     private var activeUsesDevicePlayback = false
     private var sourceFormat: AudioStreamFormat?
+    private var sourceProcessorChain: AudioFrameProcessorChain?
 
     public init(
         configuration: AudioPipelineConfiguration,
@@ -54,6 +55,7 @@ public actor AudioPipelineSession {
             policy: downlinkPolicy,
             diagnosticSink: configuration.diagnosticSink
         )
+        sourceProcessorChain = configuration.sourceProcessorChain
     }
 
     public var snapshot: AudioPipelineSnapshot {
@@ -141,6 +143,7 @@ public actor AudioPipelineSession {
         }
 
         let generation = AudioFlowGeneration(flowID: flowID)
+        sourceProcessorChain?.reset()
         usedFlowIDs.insert(flowID)
         activeGeneration = generation
         naturalEndDirection = nil
@@ -240,7 +243,10 @@ public actor AudioPipelineSession {
         else {
             return
         }
-        guard playbackFormat == microphone.capture.format else {
+        let sourceOutputFormat = configuration.sourceProcessorChain?.outputFormat(
+            for: microphone.capture.format
+        ) ?? microphone.capture.format
+        guard playbackFormat == sourceOutputFormat else {
             throw AudioDeviceEngineError.playbackFormatMismatch
         }
     }
@@ -354,25 +360,41 @@ public actor AudioPipelineSession {
             throw AudioPipelineSessionError.frameFlowMismatch
         }
 
-        sourceFormat = frame.format
-        if configuration.uplinkSender != nil {
-            await uplink.enqueue(frame)
-        }
-        guard let localMonitorSink = activeLocalMonitorSink else {
-            await sourceGate.release()
-            return
-        }
+        let processedFrames: [AudioFrame]
         do {
-            try await localMonitorSink.consume(frame)
-            await sourceGate.release()
+            processedFrames = try sourceProcessorChain?.process(frame) ?? [frame]
         } catch {
-            await sourceGate.release()
             await planFailed(
-                direction: .localMonitor,
+                direction: .source,
                 generation: generation
             )
+            await sourceGate.release()
             throw error
         }
+
+        sourceFormat = frame.format
+        let localMonitorSink = activeLocalMonitorSink
+        for processedFrame in processedFrames {
+            guard activeGeneration == generation else {
+                await sourceGate.release()
+                throw AudioPipelineSessionError.notRunning
+            }
+            if configuration.uplinkSender != nil {
+                await uplink.enqueue(processedFrame)
+            }
+            guard let localMonitorSink else { continue }
+            do {
+                try await localMonitorSink.consume(processedFrame)
+            } catch {
+                await planFailed(
+                    direction: .localMonitor,
+                    generation: generation
+                )
+                await sourceGate.release()
+                throw error
+            }
+        }
+        await sourceGate.release()
     }
 
     private func sourceEnded(generation: AudioFlowGeneration) async {
@@ -526,6 +548,7 @@ public actor AudioPipelineSession {
         if stopDownlink {
             await downlink.stop()
         }
+        sourceProcessorChain?.reset()
         if let endpointDirection {
             await emit(.endpointFailed(
                 flowID: generation.flowID,
