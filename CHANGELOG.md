@@ -67,6 +67,15 @@ All notable changes to this project will be documented in this file.
   stops capture and playback, invalidates both streaming generations,
   deactivates the session, and only then delivers route, interruption, or
   media-reset events.
+- Add a pipeline safety-buffer adapter that terminates an active session with
+  `.safetyBoundary`, synchronously claims terminal ownership before hardware
+  stop callbacks, awaits pending start/capture attempts plus playback and queue
+  cleanup, resets source processing state, and tolerates idempotent hardware-
+  stop duplication before session deactivation and device-event delivery.
+- Gate recovery and public output unmute with operation-scoped monotonic
+  configuration permits, revoke permits when their configuration closure exits,
+  and invalidate suspended or superseded queued recovery work as soon as a
+  newer safety boundary arrives.
 - Add the shared device-engine safety foundation; output starts muted and can
   only unmute after a safe route evaluation.
 - Add single-tap microphone capture with hardware-native PCM copying, bounded

@@ -211,19 +211,43 @@ delivery; it never asks the caller to recover against stale audio objects.
 Device events are FIFO-serialized through the end of consumer delivery. Caller
 session/graph configuration must run through `performConfiguration`, which is
 mutually exclusive with the hardware, buffer, deactivate, and rebuild phase.
-Every boundary event synchronously latches idempotent output mute before waiting
-for either gate, so queued delivery or configuration cannot delay fail-closed
-silence. The full mute-and-stop sequence still runs inside the transition gate.
-Delivery does not hold the configuration gate, so an event sink may await
-configuration directly while the next device event remains queued. Configuration
-calls must not be nested. Serialization does not preempt an operation already in
-progress; output must remain muted until its route safety is confirmed. A custom
-`discardPendingAudio` must not call `performConfiguration`, and an event sink must
-not await `handle`, because each callback already runs under the corresponding
-gate. Cancellation-aware configuration still occupies its FIFO position before
-exiting without running caller work. Event snapshots describe observation-time
-state; configuration must inspect the current session route again rather than
-treating a queued `routeChanged` snapshot as current.
+Every boundary event synchronously latches idempotent output mute, closes
+recovery, advances a monotonic boundary revision, and asks pending audio to
+latch terminal safety ownership before waiting for either gate. Queued delivery
+or configuration therefore cannot delay fail-closed silence or let a playback-
+stop failure steal the terminal reason. The hardware capture/playback stops and
+asynchronous pipeline cleanup still run in that order inside the transition
+gate. Delivery does not hold the configuration gate, so an event sink may await
+configuration directly after the latest boundary cleanup opens recovery. A
+newer boundary closes recovery immediately; configuration queued behind a
+superseded cleanup is rejected while recovery is closed, and a permit captured
+by suspended configuration becomes invalid. Configuration queued behind the
+latest cleanup may proceed after that cleanup reopens recovery. Configuration
+calls must not be nested. An event sink must not await `handle`, and a custom
+`discardPendingAudio` must not call `performConfiguration`, because those
+callbacks already run under their corresponding serialization gates. A
+configuration operation must likewise not wait for event handling or pending-
+audio discard. Cancellation-aware configuration still occupies its FIFO
+position before exiting without running caller work. Event snapshots describe
+observation-time state; configuration must inspect the current session route
+again rather than treating a queued `routeChanged` snapshot as current.
+
+When the active data plane is an `AudioPipelineSession`, pass an
+`AudioPipelineSafetyBufferController(session:)` as the coordinator's `buffers`
+argument. The adapter invalidates the active flow generation, stops and clears
+the session-owned uplink and downlink, resets the source processor chain, and
+finishes `.flowStopped(.safetyBoundary)` delivery before deactivation can begin.
+Its synchronous latch runs before the coordinator stops hardware, while its
+asynchronous cleanup waits for an overlapping start attempt or microphone-
+capture acquisition and for the session's device-playback cleanup. A start
+invalidated before `flowStarted` throws the content-free
+`startCancelledBySafetyBoundary` error and does not consume its flow identifier.
+Because the coordinator has already stopped the shared hardware by the cleanup
+phase, the session may issue the same capture or playback stop again; the shared
+engine's ownership checks and stop operations make that duplication safe and
+prevent stale callbacks from reviving an old generation.
+These ordering and race guarantees are covered with deterministic backends;
+they are not physical-iPhone route or media-reset acceptance evidence.
 
 The consumer must retain the coordinator until both the device engine and
 audio session are no longer in use. Its convenience initializer installs the
@@ -235,7 +259,13 @@ while the route remains stable.
 
 `AudioDeviceEngine` is the initial shared `AVAudioEngine` safety foundation.
 It starts muted, owns one player node, and refuses to unmute unless given a
-`.safe` route evaluation. Its capture and playback safety controls satisfy the
+`.safe` route evaluation plus the current `AudioSafetyConfigurationPermit` from
+the coordinator's permit-bearing `performConfiguration` overload. Permit
+validation and unmute are one synchronous MainActor operation. A permit is
+valid only for its configuration closure and is synchronously revoked before
+that closure returns, throws, or exits through cancellation, so it cannot be
+retained for a later unmute. A suspended configuration also cannot unmute after
+a newer boundary arrives. Its capture and playback safety controls satisfy the
 coordinator contract. A media-services reset discards the old engine and player
 node, cancels their pending work, and creates a fresh stopped and muted graph.
 Running, capture, and playback-format state is cleared, so recovery requires an

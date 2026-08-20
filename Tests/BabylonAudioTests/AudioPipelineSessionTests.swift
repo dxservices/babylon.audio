@@ -918,6 +918,296 @@ struct AudioPipelineSessionTests {
         })
     }
 
+    @Test("Safety invalidates and awaits a pre-registration start attempt")
+    func safetyCancelsPreRegistrationStartAttempt() async throws {
+        let flowID = AudioFlowID()
+        let startGate = SessionFirstStartAttemptGate()
+        let events = SessionRecordingEventSink()
+        let configuration = try AudioPipelineConfiguration(
+            source: .externalFrames,
+            localMonitorSink: .external(SessionRecordingSink()),
+            eventSink: events
+        )
+        let session = AudioPipelineSession(
+            configuration: configuration,
+            startAttemptSuspension: {
+                await startGate.suspendFirstAttempt()
+            }
+        )
+        let safetyBuffers = await MainActor.run {
+            AudioPipelineSafetyBufferController(session: session)
+        }
+        let starting = Task {
+            try await session.start(flowID: flowID)
+        }
+        await startGate.waitUntilFirstAttemptIsSuspended()
+
+        await MainActor.run {
+            safetyBuffers.latchSafetyBoundary()
+        }
+        let cleanup = Task {
+            await safetyBuffers.discardPendingAudio()
+        }
+        await startGate.resumeFirstAttempt()
+
+        await #expect(
+            throws: AudioPipelineSessionError.startCancelledBySafetyBoundary
+        ) {
+            try await starting.value
+        }
+        await cleanup.value
+        #expect(await events.values().isEmpty)
+
+        try await session.start(flowID: flowID)
+        #expect(await events.values() == [.flowStarted(flowID: flowID)])
+        await session.stop()
+    }
+
+    @Test("Safety cleanup blocks replacement and resets source processing")
+    func safetyCleanupOwnsTerminalBarrierAndProcessorReset() async throws {
+        let firstFlowID = AudioFlowID()
+        let replacementFlowID = AudioFlowID()
+        let outputFormat = try AudioStreamFormat.monoPCM16(sampleRate: 16_000)
+        let sender = SessionRecordingSender()
+        let events = SessionSuspendingEventSink(suspendingAt: 2)
+        let configuration = try AudioPipelineConfiguration(
+            source: .externalFrames,
+            sourceProcessorChain: makeSessionProcessorChain([
+                SessionPairFormatProcessor(outputFormat: outputFormat),
+            ]),
+            uplinkSender: sender,
+            eventSink: events
+        )
+        let session = AudioPipelineSession(configuration: configuration)
+        let safetyBuffers = await MainActor.run {
+            AudioPipelineSafetyBufferController(session: session)
+        }
+
+        try await session.start(flowID: firstFlowID)
+        try await session.submit(
+            makeSessionFrame(flowID: firstFlowID, sequence: 0)
+        )
+        #expect(sender.values().isEmpty)
+
+        let firstCleanupProbe = SessionCompletionProbe()
+        let secondCleanupProbe = SessionCompletionProbe()
+        let firstSafetyCleanup = Task {
+            await safetyBuffers.discardPendingAudio()
+            await firstCleanupProbe.complete()
+        }
+        let secondSafetyCleanup = Task {
+            await safetyBuffers.discardPendingAudio()
+            await secondCleanupProbe.complete()
+        }
+        #expect(await eventuallySession {
+            events.values() == [
+                .flowStarted(flowID: firstFlowID),
+                .flowStopped(flowID: firstFlowID, reason: .safetyBoundary),
+            ] && events.isSuspended()
+        })
+        #expect(await session.snapshot.state == .stopped)
+        #expect(!(await firstCleanupProbe.isComplete))
+        #expect(!(await secondCleanupProbe.isComplete))
+        await #expect(throws: AudioPipelineSessionError.alreadyRunning) {
+            try await session.start(flowID: replacementFlowID)
+        }
+
+        events.resumeSuspendedDelivery()
+        await firstSafetyCleanup.value
+        await secondSafetyCleanup.value
+        #expect(await firstCleanupProbe.isComplete)
+        #expect(await secondCleanupProbe.isComplete)
+        try await session.start(flowID: replacementFlowID)
+        try await session.submit(
+            makeSessionFrame(flowID: replacementFlowID, sequence: 0)
+        )
+        #expect(sender.values().isEmpty)
+        try await session.submit(
+            makeSessionFrame(flowID: replacementFlowID, sequence: 1)
+        )
+        #expect(await eventuallySession {
+            sender.values().map(\.sequence) == [1]
+        })
+
+        await safetyBuffers.discardPendingAudio()
+        #expect(await session.uplinkSnapshot.pending == .zero)
+        #expect(await session.downlinkSnapshot.pending == .zero)
+    }
+
+    @Test("Pending capture and stale callbacks cannot cross safety events")
+    func pendingCaptureAndCallbacksStayGenerationIsolated() async throws {
+        let firstFlowID = AudioFlowID()
+        let replacementFlowID = AudioFlowID()
+        let settings = try makeSessionCaptureSettings()
+        let sender = SessionRecordingSender()
+        let pipelineEvents = SessionRecordingEventSink()
+        let configuration = try AudioPipelineConfiguration(
+            source: .microphone(AudioMicrophoneSourceConfiguration(
+                inputPolicy: .builtInMicrophoneRequired,
+                capture: settings
+            )),
+            localMonitorSink: .device(policy: .privateOutputRequired),
+            uplinkSender: sender,
+            eventSink: pipelineEvents
+        )
+        let (backend, engine) = try await MainActor.run {
+            let backend = SessionBlockingStartDeviceEngineBackend()
+            let engine = AudioDeviceEngine(backend: backend)
+            try engine.configurePlayback(format: settings.format)
+            try engine.start()
+            return (backend, engine)
+        }
+        let session = AudioPipelineSession(
+            configuration: configuration,
+            deviceEngine: engine
+        )
+        let deviceEvents = await MainActor.run {
+            SessionSafetyDeviceEventSink()
+        }
+        let coordinator = await MainActor.run {
+            AudioSafetyCoordinator(
+                hardware: engine,
+                buffers: AudioPipelineSafetyBufferController(session: session),
+                session: SessionSafetyAudioSession(),
+                eventSink: deviceEvents
+            )
+        }
+
+        let firstStart = Task {
+            try await session.start(flowID: firstFlowID)
+        }
+        #expect(await backend.waitUntilFirstStartIsBlocked())
+        // This manual latch isolates stale capture callbacks while the test
+        // backend synchronously blocks the MainActor. Coordinator latch-before-
+        // hardware-stop ordering is covered by the pending device-playback test.
+        _ = session.latchSafetyBoundary()
+        let firstSafety = Task { @MainActor in
+            await coordinator.handle(.interruptionBegan)
+        }
+        backend.releaseFirstStart()
+        await backend.waitUntilStopCaptureCount(1)
+        await #expect(
+            throws: AudioPipelineSessionError.startCancelledBySafetyBoundary
+        ) {
+            try await firstStart.value
+        }
+        let firstResult = await firstSafety.value
+
+        #expect(firstResult.engagedSafetyBoundary)
+        #expect(await pipelineEvents.values() == [
+            .flowStarted(flowID: firstFlowID),
+            .flowStopped(flowID: firstFlowID, reason: .safetyBoundary),
+        ])
+        #expect(!(await engine.isCapturing))
+        #expect(await backend.stopCaptureCount == 1)
+        #expect(await backend.stopPlaybackCount == 2)
+        try await backend.deliverCapture(
+            makeSessionFrame(flowID: firstFlowID, sequence: 0),
+            at: 0
+        )
+        await backend.failCapture(at: 0, error: SessionCaptureError.failed)
+        #expect(await pipelineEvents.values().count == 2)
+
+        try await session.start(flowID: replacementFlowID)
+        try await backend.deliverCapture(
+            makeSessionFrame(flowID: firstFlowID, sequence: 1),
+            at: 0
+        )
+        await backend.failCapture(at: 0, error: SessionCaptureError.failed)
+        #expect(await session.snapshot.state == .running)
+        #expect(await engine.isCapturing)
+        let replacementFrame = try makeSessionFrame(
+            flowID: replacementFlowID,
+            sequence: 0
+        )
+        try await backend.deliverCapture(replacementFrame, at: 1)
+        #expect(await eventuallySession {
+            sender.values() == [replacementFrame]
+        })
+
+        let resetResult = await coordinator.handle(.mediaServicesReset)
+        #expect(resetResult.engagedSafetyBoundary)
+        #expect(await pipelineEvents.values() == [
+            .flowStarted(flowID: firstFlowID),
+            .flowStopped(flowID: firstFlowID, reason: .safetyBoundary),
+            .flowStarted(flowID: replacementFlowID),
+            .flowStopped(flowID: replacementFlowID, reason: .safetyBoundary),
+        ])
+        #expect(!(await engine.isRunning))
+        #expect(!(await engine.isCapturing))
+        #expect(await backend.stopCaptureCount == 2)
+        #expect(await backend.stopPlaybackCount == 4)
+        #expect(await backend.rebuildCount == 1)
+        try await backend.deliverCapture(
+            makeSessionFrame(flowID: replacementFlowID, sequence: 1),
+            at: 1
+        )
+        await backend.failCapture(at: 1, error: SessionCaptureError.failed)
+        #expect(await pipelineEvents.values().count == 4)
+        #expect(await deviceEvents.values() == [
+            .interruptionBegan,
+            .mediaServicesReset,
+        ])
+        #expect(await session.uplinkSnapshot.pending == .zero)
+        #expect(await session.downlinkSnapshot.pending == .zero)
+    }
+
+    @Test("Safety owns terminal reason for pending local and downlink playback")
+    @MainActor
+    func safetyLatchPrecedesPendingDevicePlaybackFailure() async throws {
+        let flowID = AudioFlowID()
+        let format = try AudioStreamFormat.monoPCM16(sampleRate: 24_000)
+        let backend = SessionDeviceEngineBackend(suspendsPlayback: true)
+        let engine = AudioDeviceEngine(backend: backend)
+        let receiver = SessionControlledReceiver()
+        let events = SessionRecordingEventSink()
+        try engine.configurePlayback(format: format)
+        try engine.start()
+        let configuration = try AudioPipelineConfiguration(
+            source: .externalFrames,
+            localMonitorSink: .device(policy: .privateOutputRequired),
+            downlinkReceiver: receiver,
+            downlinkSink: .device(policy: .privateOutputRequired),
+            eventSink: events
+        )
+        let session = AudioPipelineSession(
+            configuration: configuration,
+            deviceEngine: engine,
+            downlinkPolicy: try BoundedDownlinkJitterBufferPolicy(
+                targetBufferedAudioDuration: .milliseconds(20),
+                maximumBufferedAudioDuration: .seconds(1),
+                maximumFrameAge: .seconds(2)
+            )
+        )
+        let deviceEvents = SessionSafetyDeviceEventSink()
+        let coordinator = AudioSafetyCoordinator(
+            hardware: engine,
+            buffers: AudioPipelineSafetyBufferController(session: session),
+            session: SessionSafetyAudioSession(),
+            eventSink: deviceEvents
+        )
+
+        try await session.start(flowID: flowID)
+        #expect(await eventuallySession { receiver.isReady() })
+        let localSubmission = Task {
+            try await session.submit(
+                makeSessionFrame(flowID: flowID, sequence: 0)
+            )
+        }
+        receiver.yield(try makeSessionFrame(flowID: flowID, sequence: 1))
+        await backend.waitUntilPendingPlaybackSequences([0, 1])
+
+        _ = await coordinator.handle(.interruptionBegan)
+        _ = try? await localSubmission.value
+
+        #expect(await events.values() == [
+            .flowStarted(flowID: flowID),
+            .flowStopped(flowID: flowID, reason: .safetyBoundary),
+        ])
+        #expect(backend.stopPlaybackCount == 2)
+        #expect(await session.snapshot.state == .stopped)
+    }
+
     @Test("A processor can drop or expand source frames before fan-out")
     func processorOutputsReachEverySourcePlanInOrder() async throws {
         let flowID = AudioFlowID()
@@ -1263,6 +1553,8 @@ private final class SessionDeviceEngineBackend: AudioDeviceEngineBackend {
     private var captureFailureHandlers: [AudioCaptureFailureHandler?] = []
     private var playbackContinuations:
         [UInt64: CheckedContinuation<Void, any Error>] = [:]
+    private var playbackWaiters:
+        [(expected: [UInt64], continuation: CheckedContinuation<Void, Never>)] = []
     private let suspendsPlayback: Bool
 
     init(suspendsPlayback: Bool = false) {
@@ -1282,6 +1574,7 @@ private final class SessionDeviceEngineBackend: AudioDeviceEngineBackend {
         guard suspendsPlayback else { return }
         try await withCheckedThrowingContinuation { continuation in
             playbackContinuations[frame.sequence] = continuation
+            resumePlaybackWaitersIfReady()
         }
     }
     func setOutputMuted(_ muted: Bool) {}
@@ -1323,6 +1616,22 @@ private final class SessionDeviceEngineBackend: AudioDeviceEngineBackend {
     var pendingPlaybackSequences: [UInt64] {
         playbackContinuations.keys.sorted()
     }
+
+    func waitUntilPendingPlaybackSequences(_ expected: [UInt64]) async {
+        guard pendingPlaybackSequences != expected else { return }
+        await withCheckedContinuation { continuation in
+            playbackWaiters.append((expected, continuation))
+        }
+    }
+
+    private func resumePlaybackWaitersIfReady() {
+        let pending = pendingPlaybackSequences
+        let ready = playbackWaiters.filter { $0.expected == pending }
+        playbackWaiters.removeAll { $0.expected == pending }
+        for waiter in ready {
+            waiter.continuation.resume()
+        }
+    }
 }
 
 @MainActor
@@ -1332,6 +1641,12 @@ private final class SessionBlockingStartDeviceEngineBackend:
     nonisolated let startGate = SessionBlockingCaptureStartGate()
     private(set) var captureConfigurations: [AudioCaptureConfiguration] = []
     private(set) var stopCaptureCount = 0
+    private(set) var stopPlaybackCount = 0
+    private(set) var rebuildCount = 0
+    private var captureHandlers: [AudioCaptureFrameHandler] = []
+    private var captureFailureHandlers: [AudioCaptureFailureHandler?] = []
+    private var stopCaptureWaiters:
+        [(target: Int, continuation: CheckedContinuation<Void, Never>)] = []
 
     func start() throws {}
     func stop() {}
@@ -1348,15 +1663,42 @@ private final class SessionBlockingStartDeviceEngineBackend:
         onFailure: AudioCaptureFailureHandler?
     ) throws {
         captureConfigurations.append(configuration)
+        captureHandlers.append(onFrame)
+        captureFailureHandlers.append(onFailure)
         startGate.blockFirstStart()
     }
 
     func stopCapture() {
         stopCaptureCount += 1
+        let ready = stopCaptureWaiters.filter { $0.target <= stopCaptureCount }
+        stopCaptureWaiters.removeAll { $0.target <= stopCaptureCount }
+        for waiter in ready {
+            waiter.continuation.resume()
+        }
     }
 
-    func stopPlayback() {}
-    func rebuildAfterMediaServicesReset() {}
+    func stopPlayback() {
+        stopPlaybackCount += 1
+    }
+
+    func rebuildAfterMediaServicesReset() {
+        rebuildCount += 1
+    }
+
+    func deliverCapture(_ frame: AudioFrame, at index: Int) async throws {
+        try await captureHandlers[index](frame)
+    }
+
+    func failCapture(at index: Int, error: any Error) async {
+        await captureFailureHandlers[index]?(error)
+    }
+
+    func waitUntilStopCaptureCount(_ target: Int) async {
+        guard stopCaptureCount < target else { return }
+        await withCheckedContinuation { continuation in
+            stopCaptureWaiters.append((target, continuation))
+        }
+    }
 
     nonisolated func waitUntilFirstStartIsBlocked() async -> Bool {
         await startGate.waitUntilFirstStartIsBlocked()
@@ -1364,6 +1706,69 @@ private final class SessionBlockingStartDeviceEngineBackend:
 
     nonisolated func releaseFirstStart() {
         startGate.releaseFirstStart()
+    }
+}
+
+private actor SessionFirstStartAttemptGate {
+    private var attemptCount = 0
+    private var firstAttemptIsSuspended = false
+    private var firstAttemptWaiters: [CheckedContinuation<Void, Never>] = []
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func suspendFirstAttempt() async {
+        attemptCount += 1
+        guard attemptCount == 1 else { return }
+        firstAttemptIsSuspended = true
+        let waiters = firstAttemptWaiters
+        firstAttemptWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func waitUntilFirstAttemptIsSuspended() async {
+        guard !firstAttemptIsSuspended else { return }
+        await withCheckedContinuation { continuation in
+            firstAttemptWaiters.append(continuation)
+        }
+    }
+
+    func resumeFirstAttempt() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+private actor SessionCompletionProbe {
+    private(set) var isComplete = false
+
+    func complete() {
+        isComplete = true
+    }
+}
+
+@MainActor
+private final class SessionSafetyAudioSession: AudioSessionControlling {
+    let routeSnapshot = AudioRouteSnapshot.empty
+
+    func activate(_ profile: AudioSessionProfile) throws {}
+    func deactivate() throws {}
+    func selectPrivateAccessoryInput(id: String) throws -> Bool { false }
+}
+
+@MainActor
+private final class SessionSafetyDeviceEventSink: AudioDeviceEventSink {
+    private var events: [AudioDeviceEvent] = []
+
+    func receive(_ event: AudioDeviceEvent) async {
+        events.append(event)
+    }
+
+    func values() -> [AudioDeviceEvent] {
+        events
     }
 }
 

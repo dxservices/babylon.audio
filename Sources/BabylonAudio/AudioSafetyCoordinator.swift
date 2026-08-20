@@ -34,7 +34,48 @@ public protocol AudioHardwareSafetyControlling: AnyObject {
 @available(iOS 18, macOS 13, *)
 @MainActor
 public protocol AudioPendingAudioDiscarding: AnyObject {
+    /// Synchronously claims terminal ownership before hardware stop callbacks run.
+    func latchSafetyBoundary()
     func discardPendingAudio() async
+}
+
+@available(iOS 18, macOS 13, *)
+public extension AudioPendingAudioDiscarding {
+    func latchSafetyBoundary() {}
+}
+
+@available(iOS 18, macOS 13, *)
+public enum AudioSafetyCoordinatorError: Error, Equatable, Sendable {
+    case recoveryClosed
+    case invalidConfigurationPermit
+}
+
+@available(iOS 18, macOS 13, *)
+@MainActor
+public final class AudioSafetyConfigurationPermit {
+    fileprivate weak var coordinator: AudioSafetyCoordinator?
+    fileprivate let revision: UInt64
+    fileprivate var isRevoked = false
+
+    fileprivate init(
+        coordinator: AudioSafetyCoordinator,
+        revision: UInt64
+    ) {
+        self.coordinator = coordinator
+        self.revision = revision
+    }
+
+    func validate() throws {
+        guard let coordinator,
+              coordinator.validateConfigurationPermit(self)
+        else {
+            throw AudioSafetyCoordinatorError.invalidConfigurationPermit
+        }
+    }
+
+    fileprivate func revoke() {
+        isRevoked = true
+    }
 }
 
 @available(iOS 18, macOS 13, *)
@@ -65,6 +106,37 @@ public final class AudioStreamingSafetyBufferController:
     }
 }
 
+/// Adapts one pipeline session to the safety coordinator's pending-audio hook.
+///
+/// The coordinator calls the synchronous latch before stopping shared hardware.
+/// Async discard then owns queue cleanup, processor reset, and terminal event
+/// completion before session deactivation and device-event delivery continue.
+@available(iOS 18, macOS 13, *)
+@MainActor
+public final class AudioPipelineSafetyBufferController:
+    AudioPendingAudioDiscarding
+{
+    private let session: AudioPipelineSession
+    private var latchedRevisions: [UInt64] = []
+
+    public init(session: AudioPipelineSession) {
+        self.session = session
+    }
+
+    public func latchSafetyBoundary() {
+        latchedRevisions.append(session.latchSafetyBoundary())
+    }
+
+    public func discardPendingAudio() async {
+        if latchedRevisions.isEmpty {
+            latchSafetyBoundary()
+        }
+        let revision = latchedRevisions.removeFirst()
+        await session.stopForSafetyBoundary()
+        session.completeSafetyBoundary(revision: revision)
+    }
+}
+
 @available(iOS 18, macOS 13, *)
 @MainActor
 public final class AudioSafetyCoordinator {
@@ -74,6 +146,9 @@ public final class AudioSafetyCoordinator {
     private let eventSink: any AudioDeviceEventSink
     private let eventGate = AudioSerialGate()
     private let transitionGate = AudioSerialGate()
+    private var boundaryRevision: UInt64 = 0
+    private var isRecoveryOpen = true
+    private var activeConfigurationPermit: AudioSafetyConfigurationPermit?
 
     init(
         hardware: any AudioHardwareSafetyControlling,
@@ -91,12 +166,14 @@ public final class AudioSafetyCoordinator {
     public func handle(
         _ event: AudioDeviceEvent
     ) async -> AudioSafetyHandlingResult {
+        let eventBoundaryRevision: UInt64?
         switch event {
         case .routeChanged, .interruptionBegan, .mediaServicesReset:
             // This idempotent latch must not wait behind serialized work.
             hardware.muteOutput()
+            eventBoundaryRevision = beginSafetyBoundary()
         case .interruptionEnded:
-            break
+            eventBoundaryRevision = nil
         }
 
         await eventGate.acquire()
@@ -111,7 +188,13 @@ public final class AudioSafetyCoordinator {
             )
 
         case .routeChanged, .interruptionBegan, .mediaServicesReset:
-            let sessionDeactivated = await engageSafetyBoundary(for: event)
+            guard let eventBoundaryRevision else {
+                preconditionFailure("Safety event is missing its boundary revision")
+            }
+            let sessionDeactivated = await engageSafetyBoundary(
+                for: event,
+                revision: eventBoundaryRevision
+            )
             await eventSink.receive(event)
             return AudioSafetyHandlingResult(
                 engagedSafetyBoundary: true,
@@ -131,11 +214,66 @@ public final class AudioSafetyCoordinator {
         await transitionGate.acquire()
         defer { transitionGate.release() }
         try Task.checkCancellation()
+        guard isRecoveryOpen else {
+            throw AudioSafetyCoordinatorError.recoveryClosed
+        }
         return try await operation()
     }
 
+    /// Runs configuration with a permit required for public output unmute.
+    ///
+    /// The permit is scoped to `operation` and is revoked before this method
+    /// returns or throws; callers cannot retain it for later output unmute.
+    /// The permit becomes invalid synchronously when any newer safety boundary
+    /// arrives, including while `operation` is suspended.
+    public func performConfiguration<T>(
+        _ operation: @MainActor @Sendable (
+            AudioSafetyConfigurationPermit
+        ) async throws -> T
+    ) async throws -> T {
+        await transitionGate.acquire()
+        defer { transitionGate.release() }
+        try Task.checkCancellation()
+        guard isRecoveryOpen else {
+            throw AudioSafetyCoordinatorError.recoveryClosed
+        }
+        let permit = AudioSafetyConfigurationPermit(
+            coordinator: self,
+            revision: boundaryRevision
+        )
+        precondition(activeConfigurationPermit == nil)
+        activeConfigurationPermit = permit
+        defer {
+            permit.revoke()
+            if activeConfigurationPermit === permit {
+                activeConfigurationPermit = nil
+            }
+        }
+        return try await operation(permit)
+    }
+
+    private func beginSafetyBoundary() -> UInt64 {
+        precondition(boundaryRevision < UInt64.max)
+        boundaryRevision += 1
+        isRecoveryOpen = false
+        activeConfigurationPermit?.revoke()
+        buffers.latchSafetyBoundary()
+        return boundaryRevision
+    }
+
+    fileprivate func validateConfigurationPermit(
+        _ permit: AudioSafetyConfigurationPermit
+    ) -> Bool {
+        permit.coordinator === self
+            && permit.revision == boundaryRevision
+            && isRecoveryOpen
+            && !permit.isRevoked
+            && activeConfigurationPermit === permit
+    }
+
     private func engageSafetyBoundary(
-        for event: AudioDeviceEvent
+        for event: AudioDeviceEvent,
+        revision: UInt64
     ) async -> Bool {
         await transitionGate.acquire()
         defer { transitionGate.release() }
@@ -155,6 +293,9 @@ public final class AudioSafetyCoordinator {
 
         if case .mediaServicesReset = event {
             hardware.rebuildAfterMediaServicesReset()
+        }
+        if boundaryRevision == revision {
+            isRecoveryOpen = true
         }
         return sessionDeactivated
     }

@@ -292,6 +292,14 @@ public final class AudioDeviceEngine:
     }
 
     public func unmuteOutput(
+        after safety: AudioRouteSafetyEvaluation,
+        permit: AudioSafetyConfigurationPermit
+    ) throws {
+        try permit.validate()
+        try unmuteOutput(after: safety)
+    }
+
+    func unmuteOutput(
         after safety: AudioRouteSafetyEvaluation
     ) throws {
         guard case .safe = safety else {

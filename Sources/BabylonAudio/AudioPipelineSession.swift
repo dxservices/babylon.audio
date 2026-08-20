@@ -1,3 +1,5 @@
+import Foundation
+
 @available(iOS 18, macOS 13, *)
 public enum AudioPipelineSessionError: Error, Equatable, Sendable {
     case alreadyRunning
@@ -6,12 +8,19 @@ public enum AudioPipelineSessionError: Error, Equatable, Sendable {
     case externalFramesNotConfigured
     case frameFlowMismatch
     case deviceRuntimeRequired
+    case startCancelledBySafetyBoundary
 }
 
 @available(iOS 18, macOS 13, *)
 private struct PendingMicrophoneCaptureStart {
     let generation: AudioFlowGeneration
     let task: Task<AudioDeviceCaptureToken, any Error>
+}
+
+@available(iOS 18, macOS 13, *)
+private struct PendingPipelineStartAttempt {
+    let generation: AudioFlowGeneration
+    let safetyRevision: UInt64
 }
 
 @available(iOS 18, macOS 13, *)
@@ -22,9 +31,16 @@ public actor AudioPipelineSession {
     private let downlink: BoundedDownlinkJitterBuffer
     private let eventGate = AudioPipelineSerialGate()
     private let sourceGate = AudioPipelineSerialGate()
+    private let safetyBoundaryLatch = AudioPipelineSafetyBoundaryLatch()
+    private let startAttemptSuspension: (@Sendable () async -> Void)?
 
     private var activeGeneration: AudioFlowGeneration?
+    private var activeSafetyRevision: UInt64?
+    private var activeFlowHasStarted = false
     private var finishingGeneration: AudioFlowGeneration?
+    private var finishWaiters: [CheckedContinuation<Void, Never>] = []
+    private var pendingStartAttempt: PendingPipelineStartAttempt?
+    private var pendingStartWaiters: [CheckedContinuation<Void, Never>] = []
     private var sourceTask: Task<Void, Never>?
     private var receiverTask: Task<Void, Never>?
     private var naturalEndDirection: AudioDirection?
@@ -47,6 +63,28 @@ public actor AudioPipelineSession {
     ) {
         self.configuration = configuration
         self.deviceEngine = deviceEngine
+        startAttemptSuspension = nil
+        uplink = BoundedUplinkQueue(
+            policy: uplinkPolicy,
+            diagnosticSink: configuration.diagnosticSink
+        )
+        downlink = BoundedDownlinkJitterBuffer(
+            policy: downlinkPolicy,
+            diagnosticSink: configuration.diagnosticSink
+        )
+        sourceProcessorChain = configuration.sourceProcessorChain
+    }
+
+    init(
+        configuration: AudioPipelineConfiguration,
+        deviceEngine: AudioDeviceEngine? = nil,
+        uplinkPolicy: BoundedUplinkQueuePolicy = .initial,
+        downlinkPolicy: BoundedDownlinkJitterBufferPolicy = .initial,
+        startAttemptSuspension: @escaping @Sendable () async -> Void
+    ) {
+        self.configuration = configuration
+        self.deviceEngine = deviceEngine
+        self.startAttemptSuspension = startAttemptSuspension
         uplink = BoundedUplinkQueue(
             policy: uplinkPolicy,
             diagnosticSink: configuration.diagnosticSink
@@ -93,6 +131,7 @@ public actor AudioPipelineSession {
     public func start(flowID: AudioFlowID = AudioFlowID()) async throws {
         guard activeGeneration == nil,
               finishingGeneration == nil,
+              pendingStartAttempt == nil,
               pendingMicrophoneCaptureStart == nil
         else {
             throw AudioPipelineSessionError.alreadyRunning
@@ -100,6 +139,43 @@ public actor AudioPipelineSession {
         guard !usedFlowIDs.contains(flowID) else {
             throw AudioPipelineSessionError.reusedFlowID
         }
+        guard let safetyRevision = safetyBoundaryLatch.registerStartAttempt()
+        else {
+            throw AudioPipelineSessionError.startCancelledBySafetyBoundary
+        }
+        let generation = AudioFlowGeneration(flowID: flowID)
+        pendingStartAttempt = PendingPipelineStartAttempt(
+            generation: generation,
+            safetyRevision: safetyRevision
+        )
+
+        do {
+            try await beginStart(
+                flowID: flowID,
+                generation: generation,
+                safetyRevision: safetyRevision
+            )
+        } catch {
+            clearPendingStartAttempt(generation: generation)
+            if safetyBoundaryLatch.wasInvalidated(since: safetyRevision) {
+                if activeGeneration == generation {
+                    await finish(
+                        generation: generation,
+                        reason: .safetyBoundary,
+                        stopDownlink: true
+                    )
+                }
+                throw AudioPipelineSessionError.startCancelledBySafetyBoundary
+            }
+            throw error
+        }
+    }
+
+    private func beginStart(
+        flowID: AudioFlowID,
+        generation: AudioFlowGeneration,
+        safetyRevision: UInt64
+    ) async throws {
         let activeSource: (any AudioFrameSource)?
         let microphoneCapture: AudioCaptureSettings?
         switch configuration.source {
@@ -117,10 +193,17 @@ public actor AudioPipelineSession {
             microphoneCapture = microphone.capture
         }
 
+        await startAttemptSuspension?()
+        try Task.checkCancellation()
+
         let usesDevicePlayback = configurationUsesDevicePlayback
         if usesDevicePlayback {
             try await validateDevicePlaybackRuntime()
         }
+        try ensurePendingStartIsCurrent(
+            generation: generation,
+            safetyRevision: safetyRevision
+        )
 
         let localMonitorSink: (any AudioFrameSink)?
         switch configuration.localMonitorSink {
@@ -142,16 +225,25 @@ public actor AudioPipelineSession {
             downlinkSink = nil
         }
 
-        let generation = AudioFlowGeneration(flowID: flowID)
-        sourceProcessorChain?.reset()
-        usedFlowIDs.insert(flowID)
-        activeGeneration = generation
-        naturalEndDirection = nil
-        observedNaturalEndDirections = []
-        state = .running
-        activeLocalMonitorSink = localMonitorSink
-        activeUsesDevicePlayback = usesDevicePlayback
-        sourceFormat = nil
+        guard safetyBoundaryLatch.activateStart(
+            revision: safetyRevision,
+            operation: {
+                clearPendingStartAttempt(generation: generation)
+                sourceProcessorChain?.reset()
+                activeGeneration = generation
+                activeSafetyRevision = safetyRevision
+                activeFlowHasStarted = false
+                naturalEndDirection = nil
+                observedNaturalEndDirections = []
+                state = .running
+                activeLocalMonitorSink = localMonitorSink
+                activeUsesDevicePlayback = usesDevicePlayback
+                sourceFormat = nil
+            }
+        ) else {
+            clearPendingStartAttempt(generation: generation)
+            throw AudioPipelineSessionError.startCancelledBySafetyBoundary
+        }
         if let sender = configuration.uplinkSender {
             await uplink.start(
                 flowID: flowID,
@@ -163,6 +255,10 @@ public actor AudioPipelineSession {
                     )
                 }
             )
+            guard try await startCanContinue(
+                generation: generation,
+                safetyRevision: safetyRevision
+            ) else { return }
         }
         if let downlinkSink {
             await downlink.start(
@@ -175,9 +271,34 @@ public actor AudioPipelineSession {
                     )
                 }
             )
+            guard try await startCanContinue(
+                generation: generation,
+                safetyRevision: safetyRevision
+            ) else { return }
+        }
+        guard safetyBoundaryLatch.activateStart(
+            revision: safetyRevision,
+            operation: {
+                guard activeGeneration == generation else { return }
+                activeFlowHasStarted = true
+                usedFlowIDs.insert(flowID)
+            }
+        ), activeGeneration == generation, activeFlowHasStarted else {
+            if safetyBoundaryLatch.wasInvalidated(since: safetyRevision) {
+                await finish(
+                    generation: generation,
+                    reason: .safetyBoundary,
+                    stopDownlink: true
+                )
+                throw AudioPipelineSessionError.startCancelledBySafetyBoundary
+            }
+            return
         }
         await emit(.flowStarted(flowID: flowID))
-        guard activeGeneration == generation else { return }
+        guard try await startCanContinue(
+            generation: generation,
+            safetyRevision: safetyRevision
+        ) else { return }
 
         if let activeSource {
             sourceTask = Task { [weak self] in
@@ -203,7 +324,10 @@ public actor AudioPipelineSession {
                 microphoneCapture,
                 generation: generation
             )
-            guard activeGeneration == generation else { return }
+            guard try await startCanContinue(
+                generation: generation,
+                safetyRevision: safetyRevision
+            ) else { return }
         }
 
         guard let receiver = configuration.downlinkReceiver else { return }
@@ -219,6 +343,44 @@ public actor AudioPipelineSession {
             } catch {
                 await self?.receiverFailed(error, generation: generation)
             }
+        }
+    }
+
+    private func ensurePendingStartIsCurrent(
+        generation: AudioFlowGeneration,
+        safetyRevision: UInt64
+    ) throws {
+        guard pendingStartAttempt?.generation == generation,
+              !safetyBoundaryLatch.wasInvalidated(since: safetyRevision)
+        else {
+            throw AudioPipelineSessionError.startCancelledBySafetyBoundary
+        }
+    }
+
+    private func startCanContinue(
+        generation: AudioFlowGeneration,
+        safetyRevision: UInt64
+    ) async throws -> Bool {
+        guard safetyBoundaryLatch.wasInvalidated(since: safetyRevision) else {
+            return activeGeneration == generation
+        }
+        if activeGeneration == generation {
+            await finish(
+                generation: generation,
+                reason: .safetyBoundary,
+                stopDownlink: true
+            )
+        }
+        throw AudioPipelineSessionError.startCancelledBySafetyBoundary
+    }
+
+    private func clearPendingStartAttempt(generation: AudioFlowGeneration) {
+        guard pendingStartAttempt?.generation == generation else { return }
+        pendingStartAttempt = nil
+        let waiters = pendingStartWaiters
+        pendingStartWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
         }
     }
 
@@ -399,12 +561,28 @@ public actor AudioPipelineSession {
 
     private func sourceEnded(generation: AudioFlowGeneration) async {
         guard activeGeneration == generation else { return }
+        if safetyBoundaryOwnsTerminal(generation: generation) {
+            await finish(
+                generation: generation,
+                reason: .safetyBoundary,
+                stopDownlink: true
+            )
+            return
+        }
         sourceTask = nil
         observedNaturalEndDirections.insert(.source)
         guard claimNaturalEnd(
             direction: .source,
             generation: generation
         ) else { return }
+        if safetyBoundaryOwnsTerminal(generation: generation) {
+            await finish(
+                generation: generation,
+                reason: .safetyBoundary,
+                stopDownlink: true
+            )
+            return
+        }
         await emit(.endpointEnded(
             flowID: generation.flowID,
             direction: .source
@@ -443,6 +621,36 @@ public actor AudioPipelineSession {
         )
     }
 
+    nonisolated func latchSafetyBoundary() -> UInt64 {
+        safetyBoundaryLatch.latch()
+    }
+
+    nonisolated func completeSafetyBoundary(revision: UInt64) {
+        safetyBoundaryLatch.complete(revision: revision)
+    }
+
+    func stopForSafetyBoundary() async {
+        while true {
+            if let generation = activeGeneration {
+                await finish(
+                    generation: generation,
+                    reason: .safetyBoundary,
+                    stopDownlink: true
+                )
+                return
+            }
+            if pendingStartAttempt != nil {
+                await waitForPendingStartAttempt()
+                continue
+            }
+            if finishingGeneration != nil {
+                await waitForFinishingGeneration()
+                continue
+            }
+            return
+        }
+    }
+
     private func receive(
         _ frame: AudioFrame,
         generation: AudioFlowGeneration
@@ -453,12 +661,28 @@ public actor AudioPipelineSession {
 
     private func receiverEnded(generation: AudioFlowGeneration) async {
         guard activeGeneration == generation else { return }
+        if safetyBoundaryOwnsTerminal(generation: generation) {
+            await finish(
+                generation: generation,
+                reason: .safetyBoundary,
+                stopDownlink: true
+            )
+            return
+        }
         receiverTask = nil
         observedNaturalEndDirections.insert(.downlink)
         guard claimNaturalEnd(
             direction: .downlink,
             generation: generation
         ) else { return }
+        if safetyBoundaryOwnsTerminal(generation: generation) {
+            await finish(
+                generation: generation,
+                reason: .safetyBoundary,
+                stopDownlink: true
+            )
+            return
+        }
         await emit(.endpointEnded(
             flowID: generation.flowID,
             direction: .downlink
@@ -507,6 +731,19 @@ public actor AudioPipelineSession {
         return true
     }
 
+    private func safetyBoundaryOwnsTerminal(
+        generation: AudioFlowGeneration
+    ) -> Bool {
+        guard activeGeneration == generation,
+              let activeSafetyRevision
+        else {
+            return false
+        }
+        return safetyBoundaryLatch.wasInvalidated(
+            since: activeSafetyRevision
+        )
+    }
+
     private func finish(
         generation: AudioFlowGeneration,
         reason: AudioFlowStopReason,
@@ -514,7 +751,20 @@ public actor AudioPipelineSession {
         endpointDirection: AudioDirection? = nil
     ) async {
         guard activeGeneration == generation else { return }
+        let safetyOwnsTerminal = activeSafetyRevision.map {
+            safetyBoundaryLatch.wasInvalidated(since: $0)
+        } ?? false
+        let finalReason: AudioFlowStopReason = safetyOwnsTerminal
+            ? .safetyBoundary
+            : reason
+        let finalStopDownlink = safetyOwnsTerminal ? true : stopDownlink
+        let finalEndpointDirection = safetyOwnsTerminal
+            ? nil
+            : endpointDirection
+        let emitsTerminalEvent = activeFlowHasStarted
         activeGeneration = nil
+        activeSafetyRevision = nil
+        activeFlowHasStarted = false
         finishingGeneration = generation
         naturalEndDirection = nil
         state = .stopped
@@ -545,21 +795,42 @@ public actor AudioPipelineSession {
             await deviceEngine?.stopPlayback()
         }
         await uplink.stop()
-        if stopDownlink {
+        if finalStopDownlink {
             await downlink.stop()
         }
         sourceProcessorChain?.reset()
-        if let endpointDirection {
+        if emitsTerminalEvent, let finalEndpointDirection {
             await emit(.endpointFailed(
                 flowID: generation.flowID,
-                direction: endpointDirection
+                direction: finalEndpointDirection
             ))
         }
-        await emit(
-            .flowStopped(flowID: generation.flowID, reason: reason)
-        )
+        if emitsTerminalEvent {
+            await emit(
+                .flowStopped(flowID: generation.flowID, reason: finalReason)
+            )
+        }
         if finishingGeneration == generation {
             finishingGeneration = nil
+            let waiters = finishWaiters
+            finishWaiters.removeAll()
+            for waiter in waiters {
+                waiter.resume()
+            }
+        }
+    }
+
+    private func waitForFinishingGeneration() async {
+        guard finishingGeneration != nil else { return }
+        await withCheckedContinuation { continuation in
+            finishWaiters.append(continuation)
+        }
+    }
+
+    private func waitForPendingStartAttempt() async {
+        guard pendingStartAttempt != nil else { return }
+        await withCheckedContinuation { continuation in
+            pendingStartWaiters.append(continuation)
         }
     }
 
@@ -568,6 +839,53 @@ public actor AudioPipelineSession {
         await eventGate.acquire()
         await eventSink.receive(event)
         await eventGate.release()
+    }
+}
+
+@available(iOS 18, macOS 13, *)
+private final class AudioPipelineSafetyBoundaryLatch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var revision: UInt64 = 0
+    private var isBoundaryActive = false
+
+    func registerStartAttempt() -> UInt64? {
+        lock.withLock {
+            guard !isBoundaryActive else { return nil }
+            return revision
+        }
+    }
+
+    func activateStart(
+        revision expectedRevision: UInt64,
+        operation: () -> Void
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isBoundaryActive, revision == expectedRevision else {
+            return false
+        }
+        operation()
+        return true
+    }
+
+    func latch() -> UInt64 {
+        lock.withLock {
+            precondition(revision < UInt64.max)
+            revision += 1
+            isBoundaryActive = true
+            return revision
+        }
+    }
+
+    func complete(revision completedRevision: UInt64) {
+        lock.withLock {
+            guard revision == completedRevision else { return }
+            isBoundaryActive = false
+        }
+    }
+
+    func wasInvalidated(since expectedRevision: UInt64) -> Bool {
+        lock.withLock { revision != expectedRevision }
     }
 }
 
