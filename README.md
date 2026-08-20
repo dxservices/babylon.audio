@@ -87,9 +87,22 @@ race old processor reset, queue cleanup, or terminal event delivery. An
 machine; it must not await a lifecycle method on the same session because that
 method may be waiting for the current event delivery to finish. The sink may
 spawn a recovery task without awaiting it; after the callback returns, that task
-can wait for `stop()` and then restart. Each flow identifier is single-use within
-one session instance, so a late completion can never match a later generation
-that happens to reuse the same identifier.
+can wait for `stop()` and then restart. A sink also must not directly await
+`AudioSafetyCoordinator.performConfiguration` from any pipeline event callback;
+the safety-cleanup path would otherwise create a transition/event gate cycle.
+The coordinator detects direct pipeline-event delivery and throws
+`configurationDuringPipelineEventDelivery`; hand configuration to a task that
+first waits for the session terminal barrier. The delivery-context marker is
+revoked when the callback returns, including in a child task that inherited the
+marker, so that recovery task can then wait for the coordinator transition and
+configure normally. Each flow identifier is single-use within one
+session instance, so a late completion can never match a later generation that
+happens to reuse the same identifier. A successful `start()` return does not
+guarantee that `flowStarted` was delivered: a concurrent consumer stop may win
+before event ownership commits and produce no lifecycle events. If a safety
+boundary wins after `flowStarted`, `start()` throws
+`startCancelledBySafetyBoundary`; that flow identifier remains consumed because
+its started lifecycle was already externally observable.
 
 Caller-driven `.externalFrames` can now fan each accepted frame into an external
 local-monitor sink and a format-aware bounded uplink queue under the same flow
@@ -149,12 +162,15 @@ format to match the processor chain's declared final output format, or the
 normalized capture format when no chain is present. Natural downlink completion
 drains eligible accepted frames through the data-consumed scheduling boundary,
 not audible completion, before terminal delivery. Consumer stop, failure, or
-stopping a flow before starting its replacement stops device playback to
-release pending consumes, but leaves the shared engine running for the external
-safety/runtime owner. This shared-engine wiring does not by itself prove a safe
-private route, physical microphone capture, or physical playback; route
-evaluation and output unmute remain the runtime owner's fail-closed
-responsibility.
+stopping a flow before starting its replacement stops only that session's
+playback owner, releasing its pending consumes without interrupting another
+session sharing the engine. One session uses the same owner for local-monitor
+and downlink playback. The engine remains running for the external
+safety/runtime owner; the public `stopPlayback()` and coordinator safety stop
+remain global fail-closed operations. This shared-engine wiring does not by
+itself prove a safe private route, physical microphone capture, or physical
+playback; route evaluation and output unmute remain the runtime owner's
+fail-closed responsibility.
 
 The deterministic session suite also composes local monitor, uplink, and
 downlink in one configuration. Both source-driven branches observe the same
@@ -223,8 +239,12 @@ latch terminal safety ownership before waiting for either gate. Queued delivery
 or configuration therefore cannot delay fail-closed silence or let a playback-
 stop failure steal the terminal reason. The hardware capture/playback stops and
 asynchronous pipeline cleanup still run in that order inside the transition
-gate. Delivery does not hold the configuration gate, so an event sink may await
-configuration directly after the latest boundary cleanup opens recovery. A
+gate. Device-event delivery does not hold the configuration gate, so an
+`AudioDeviceEventSink` may await configuration directly after the latest
+boundary cleanup opens recovery. Pipeline `AudioEventSink` delivery can occur
+inside pending-audio cleanup and therefore cannot await configuration there;
+the coordinator rejects this dynamic reentry before it waits on the transition
+gate. A
 newer boundary closes recovery immediately; configuration queued behind a
 superseded cleanup is rejected while recovery is closed, and a permit captured
 by suspended configuration becomes invalid. Configuration queued behind the
@@ -264,19 +284,20 @@ specialization is a later optimization, so continuity guarantees apply only
 while the route remains stable.
 
 `AudioDeviceEngine` is the initial shared `AVAudioEngine` safety foundation.
-It starts muted, owns one player node, and refuses to unmute unless given a
-`.safe` route evaluation plus the current `AudioSafetyConfigurationPermit` from
-the coordinator's permit-bearing `performConfiguration` overload. Permit
-validation and unmute are one synchronous MainActor operation. A permit is
-valid only for its configuration closure and is synchronously revoked before
-that closure returns, throws, or exits through cancellation, so it cannot be
-retained for a later unmute. A suspended configuration also cannot unmute after
+It starts muted, owns one player node per active playback owner, and refuses to
+unmute unless given a `.safe` route evaluation plus the current
+`AudioSafetyConfigurationPermit` from the coordinator's permit-bearing
+`performConfiguration` overload. Permit validation and unmute are one
+synchronous MainActor operation. A permit is valid only for its configuration
+closure and is synchronously revoked before that closure returns, throws, or
+exits through cancellation, so it cannot be retained for a later unmute. A
+suspended configuration also cannot unmute after
 a newer boundary arrives. Its capture and playback safety controls satisfy the
-coordinator contract. A media-services reset discards the old engine and player
-node, cancels their pending work, and creates a fresh stopped and muted graph.
-Running, capture, and playback-format state is cleared, so recovery requires an
-explicit session configuration, playback-format configuration, engine start,
-and safe-route unmute.
+coordinator contract. A media-services reset discards the old engine and all
+playback-owner nodes, cancels their pending work, and creates a fresh stopped
+and muted graph. Running, capture, and playback-format state is cleared, so
+recovery requires an explicit session configuration, playback-format
+configuration, engine start, and safe-route unmute.
 
 Microphone capture installs one input-node tap using the hardware-native PCM
 format. The callback only validates the bounded frame count, copies PCM bytes,
@@ -303,7 +324,12 @@ delivery barrier.
 cancellation, but it is not an async delivery barrier: an `onFrame` call already
 in flight may return after `stopCapture()`. Consumers must invalidate the flow
 generation and stop downstream bounded queues as part of the same safety
-transition; late delivery is then rejected by generation. PCM playback
+transition; late delivery is then rejected by generation. Public
+`AudioDeviceEngine.stopCapture()` is a low-level global hardware control: calling
+it while a microphone pipeline is active does not synthesize a source failure
+and will silently starve that session. Runtime owners must stop microphone
+capture through the pipeline lifecycle or the safety coordinator while a flow
+is active. PCM playback
 scheduling uses the same shared engine. Callers configure one exact PCM format
 before starting the engine; the engine then acts as an `AudioFrameSink` and
 rejects missing or mismatched playback configuration. Each consume operation
@@ -316,9 +342,15 @@ unmute, `stopPlayback`, or task cancellation. Muting an already-started player
 sets its volume to zero without stopping it, so scheduled data continues to be
 consumed silently; the safety coordinator follows mute with `stopPlayback` when
 discard is required. `stopPlayback()` terminates all pending bridges before
-stopping the player node, so discarded buffers fail with `playbackStopped`
+stopping every playback-owner node, so discarded buffers fail with
+`playbackStopped`
 instead of reporting successful consumption. Simulator compilation does not
 validate microphone, playback, or route hardware behavior.
+
+Public BabylonAudio enums are intentionally non-frozen before 1.0 and may gain
+cases as the package contract evolves. Consumers in other modules must include
+an `@unknown default` branch rather than relying on an exhaustive switch. Case
+removal and semantic reuse remain breaking changes.
 
 ## Non-goals
 

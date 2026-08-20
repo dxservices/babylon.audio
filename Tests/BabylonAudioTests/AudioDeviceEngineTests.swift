@@ -116,6 +116,37 @@ struct AudioDeviceEngineTests {
         }
     }
 
+    @Test("Global playback stop cancels every pending playback owner")
+    func globalStopPlaybackCancelsAllOwners() async throws {
+        let format = try AudioStreamFormat.monoPCM16(sampleRate: 24_000)
+        let backend = RecordingDeviceEngineBackend()
+        let engine = AudioDeviceEngine(backend: backend)
+        try engine.configurePlayback(format: format)
+        try engine.start()
+        let firstFrame = try makePlaybackFrame(format: format, sequence: 70)
+        let secondFrame = try makePlaybackFrame(format: format, sequence: 71)
+        let firstToken = engine.makePlaybackToken()
+        let secondToken = engine.makePlaybackToken()
+        let firstConsumption = Task {
+            try await engine.consume(firstFrame, token: firstToken)
+        }
+        let secondConsumption = Task {
+            try await engine.consume(secondFrame, token: secondToken)
+        }
+        for _ in 0..<10 { await Task.yield() }
+        #expect(backend.pendingPlaybackSequences == [70, 71])
+
+        engine.stopPlayback()
+
+        await #expect(throws: AudioDeviceEngineError.playbackStopped) {
+            try await firstConsumption.value
+        }
+        await #expect(throws: AudioDeviceEngineError.playbackStopped) {
+            try await secondConsumption.value
+        }
+        #expect(backend.pendingPlaybackSequences.isEmpty)
+    }
+
     @Test("Capture callback overflow becomes a visible bounded failure")
     func captureCallbackOverflowIsVisible() async {
         let bridge = BoundedAudioCaptureBridge(capacity: 2)
@@ -338,11 +369,12 @@ struct AudioDeviceEngineTests {
     }
 
     private func makePlaybackFrame(
-        format: AudioStreamFormat
+        format: AudioStreamFormat,
+        sequence: UInt64 = 7
     ) throws -> AudioFrame {
         try AudioFrame(
             flowID: AudioFlowID(),
-            sequence: 7,
+            sequence: sequence,
             timestamp: .zero,
             format: format,
             payload: Data(count: 960),
@@ -397,7 +429,10 @@ private final class RecordingDeviceEngineBackend: AudioDeviceEngineBackend {
         actions.append(.configureVoiceProcessing(policy))
     }
 
-    func schedulePlayback(_ frame: AudioFrame) async throws {
+    func schedulePlayback(
+        _ frame: AudioFrame,
+        owner: AudioDevicePlaybackOwner
+    ) async throws {
         actions.append(.schedulePlayback(frame.sequence))
         try await withCheckedThrowingContinuation { continuation in
             playbackContinuations[frame.sequence] = continuation
@@ -430,7 +465,7 @@ private final class RecordingDeviceEngineBackend: AudioDeviceEngineBackend {
         actions.append(.stopCapture)
     }
 
-    func stopPlayback() {
+    func stopPlayback(owner: AudioDevicePlaybackOwner?) {
         actions.append(.stopPlayback)
         let pending = Array(playbackContinuations.values)
         playbackContinuations.removeAll()

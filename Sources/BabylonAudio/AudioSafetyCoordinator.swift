@@ -48,6 +48,7 @@ public extension AudioPendingAudioDiscarding {
 public enum AudioSafetyCoordinatorError: Error, Equatable, Sendable {
     case recoveryClosed
     case invalidConfigurationPermit
+    case configurationDuringPipelineEventDelivery
 }
 
 @available(iOS 18, macOS 13, *)
@@ -206,11 +207,17 @@ public final class AudioSafetyCoordinator {
     /// Serializes caller configuration against fail-closed hardware/session work.
     ///
     /// Device-event delivery does not hold this gate, so an event sink may call
-    /// this method directly. Do not nest `performConfiguration` calls, call it
-    /// from `discardPendingAudio`, or await `handle` from an event sink.
+    /// this method directly. Pipeline-event delivery is rejected before gate
+    /// acquisition; hand recovery to a task that first waits for the pipeline's
+    /// terminal barrier. Do not nest `performConfiguration` calls, call it from
+    /// `discardPendingAudio`, or await `handle` from an event sink.
     public func performConfiguration<T>(
         _ operation: @MainActor @Sendable () async throws -> T
     ) async throws -> T {
+        guard !AudioPipelineEventDeliveryContext.isDirectDelivery else {
+            throw AudioSafetyCoordinatorError
+                .configurationDuringPipelineEventDelivery
+        }
         await transitionGate.acquire()
         defer { transitionGate.release() }
         try Task.checkCancellation()
@@ -231,6 +238,10 @@ public final class AudioSafetyCoordinator {
             AudioSafetyConfigurationPermit
         ) async throws -> T
     ) async throws -> T {
+        guard !AudioPipelineEventDeliveryContext.isDirectDelivery else {
+            throw AudioSafetyCoordinatorError
+                .configurationDuringPipelineEventDelivery
+        }
         await transitionGate.acquire()
         defer { transitionGate.release() }
         try Task.checkCancellation()

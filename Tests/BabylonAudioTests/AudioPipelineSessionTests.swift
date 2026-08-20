@@ -394,6 +394,7 @@ struct AudioPipelineSessionTests {
             sourceFrame.sequence,
             downlinkFrame.sequence,
         ])
+        #expect(Set(backend.scheduledPlaybackOwners.values).count == 1)
         #expect(backend.stopCaptureCount == 1)
         #expect(backend.stopPlaybackCount == 1)
         #expect(engine.isRunning)
@@ -494,6 +495,131 @@ struct AudioPipelineSessionTests {
         #expect(backend.stopPlaybackCount == 1)
         #expect(engine.isRunning)
         #expect(await session.snapshot.state == .stopped)
+    }
+
+    @Test("Stopping one shared-engine session preserves another playback owner")
+    @MainActor
+    func sharedEnginePlaybackOwnersAreIsolated() async throws {
+        let firstFlowID = AudioFlowID()
+        let secondFlowID = AudioFlowID()
+        let firstFrame = try makeSessionFrame(
+            flowID: firstFlowID,
+            sequence: 41
+        )
+        let secondFrame = try makeSessionFrame(
+            flowID: secondFlowID,
+            sequence: 42
+        )
+        let backend = SessionDeviceEngineBackend(suspendsPlayback: true)
+        let engine = AudioDeviceEngine(backend: backend)
+        try engine.configurePlayback(format: firstFrame.format)
+        try engine.start()
+        let firstSession = AudioPipelineSession(
+            configuration: try AudioPipelineConfiguration(
+                source: .externalFrames,
+                localMonitorSink: .device(policy: .privateOutputRequired)
+            ),
+            deviceEngine: engine
+        )
+        let secondSession = AudioPipelineSession(
+            configuration: try AudioPipelineConfiguration(
+                source: .externalFrames,
+                localMonitorSink: .device(policy: .privateOutputRequired)
+            ),
+            deviceEngine: engine
+        )
+
+        try await firstSession.start(flowID: firstFlowID)
+        try await secondSession.start(flowID: secondFlowID)
+        let firstSubmission = Task {
+            try await firstSession.submit(firstFrame)
+        }
+        let secondSubmission = Task {
+            try await secondSession.submit(secondFrame)
+        }
+        await backend.waitUntilPendingPlaybackSequences([41, 42])
+
+        await firstSession.stop()
+
+        await #expect(throws: AudioDeviceEngineError.playbackStopped) {
+            try await firstSubmission.value
+        }
+        #expect(backend.pendingPlaybackSequences == [42])
+        #expect(Set(backend.scheduledPlaybackOwners.values).count == 2)
+
+        backend.completePlayback(sequence: 42)
+        try await secondSubmission.value
+        #expect(await secondSession.snapshot.state == .running)
+        await secondSession.stop()
+        #expect(backend.stopPlaybackCount == 2)
+    }
+
+    @Test("Stop after uplink enqueue prevents a stale monitor frame")
+    func stopAfterUplinkEnqueueDropsMonitorDelivery() async throws {
+        let flowID = AudioFlowID()
+        let frame = try makeSessionFrame(flowID: flowID, sequence: 51)
+        let monitor = SessionRecordingSink()
+        let gate = SessionSourceFanOutGate()
+        let session = AudioPipelineSession(
+            configuration: try AudioPipelineConfiguration(
+                source: .externalFrames,
+                localMonitorSink: .external(monitor),
+                uplinkSender: SessionRecordingSender()
+            ),
+            startAttemptSuspension: {},
+            sourcePostUplinkSuspension: { await gate.suspend() }
+        )
+        try await session.start(flowID: flowID)
+        let submission = Task { try await session.submit(frame) }
+        await gate.waitUntilSuspended()
+
+        await session.stop()
+        await gate.resume()
+
+        await #expect(throws: AudioPipelineSessionError.notRunning) {
+            try await submission.value
+        }
+        #expect(await monitor.values().isEmpty)
+    }
+
+    @Test("Endpoint failure after uplink enqueue prevents a stale monitor frame")
+    @MainActor
+    func failureAfterUplinkEnqueueDropsMonitorDelivery() async throws {
+        let flowID = AudioFlowID()
+        let frame = try makeSessionFrame(flowID: flowID, sequence: 52)
+        let backend = SessionDeviceEngineBackend()
+        let engine = AudioDeviceEngine(backend: backend)
+        try engine.configurePlayback(format: frame.format)
+        try engine.start()
+        let events = SessionRecordingEventSink()
+        let gate = SessionSourceFanOutGate()
+        let session = AudioPipelineSession(
+            configuration: try AudioPipelineConfiguration(
+                source: .externalFrames,
+                localMonitorSink: .device(policy: .privateOutputRequired),
+                uplinkSender: SessionFailingSender(),
+                eventSink: events
+            ),
+            deviceEngine: engine,
+            startAttemptSuspension: {},
+            sourcePostUplinkSuspension: { await gate.suspend() }
+        )
+        try await session.start(flowID: flowID)
+        let submission = Task { try await session.submit(frame) }
+        await gate.waitUntilSuspended()
+        #expect(await eventuallySession {
+            await events.values().last == .flowStopped(
+                flowID: flowID,
+                reason: .endpointFailure
+            )
+        })
+
+        await gate.resume()
+
+        await #expect(throws: AudioPipelineSessionError.notRunning) {
+            try await submission.value
+        }
+        #expect(backend.playbackSequences.isEmpty)
     }
 
     @Test("The first naturally ended endpoint owns shared-flow termination")
@@ -1622,11 +1748,14 @@ private final class SessionDeviceEngineBackend: AudioDeviceEngineBackend {
     private(set) var stopCaptureCount = 0
     private(set) var playbackFormats: [AudioStreamFormat] = []
     private(set) var playbackSequences: [UInt64] = []
+    private(set) var scheduledPlaybackOwners:
+        [UInt64: AudioDevicePlaybackOwner] = [:]
     private(set) var stopPlaybackCount = 0
     private var captureHandlers: [AudioCaptureFrameHandler] = []
     private var captureFailureHandlers: [AudioCaptureFailureHandler?] = []
     private var playbackContinuations:
         [UInt64: CheckedContinuation<Void, any Error>] = [:]
+    private var playbackOwners: [UInt64: AudioDevicePlaybackOwner] = [:]
     private var playbackWaiters:
         [(expected: [UInt64], continuation: CheckedContinuation<Void, Never>)] = []
     private let suspendsPlayback: Bool
@@ -1643,11 +1772,16 @@ private final class SessionDeviceEngineBackend: AudioDeviceEngineBackend {
     func configureVoiceProcessing(
         _ policy: AudioVoiceProcessingPolicy
     ) throws {}
-    func schedulePlayback(_ frame: AudioFrame) async throws {
+    func schedulePlayback(
+        _ frame: AudioFrame,
+        owner: AudioDevicePlaybackOwner
+    ) async throws {
         playbackSequences.append(frame.sequence)
+        scheduledPlaybackOwners[frame.sequence] = owner
         guard suspendsPlayback else { return }
         try await withCheckedThrowingContinuation { continuation in
             playbackContinuations[frame.sequence] = continuation
+            playbackOwners[frame.sequence] = owner
             resumePlaybackWaitersIfReady()
         }
     }
@@ -1667,10 +1801,15 @@ private final class SessionDeviceEngineBackend: AudioDeviceEngineBackend {
         stopCaptureCount += 1
     }
 
-    func stopPlayback() {
+    func stopPlayback(owner: AudioDevicePlaybackOwner?) {
         stopPlaybackCount += 1
-        let continuations = Array(playbackContinuations.values)
-        playbackContinuations.removeAll()
+        let sequences = playbackContinuations.keys.filter {
+            owner == nil || playbackOwners[$0] == owner
+        }
+        let continuations = sequences.compactMap {
+            playbackOwners.removeValue(forKey: $0)
+            return playbackContinuations.removeValue(forKey: $0)
+        }
         for continuation in continuations {
             continuation.resume(
                 throwing: AudioDeviceEngineError.playbackStopped
@@ -1689,6 +1828,12 @@ private final class SessionDeviceEngineBackend: AudioDeviceEngineBackend {
 
     var pendingPlaybackSequences: [UInt64] {
         playbackContinuations.keys.sorted()
+    }
+
+    func completePlayback(sequence: UInt64) {
+        playbackOwners.removeValue(forKey: sequence)
+        playbackContinuations.removeValue(forKey: sequence)?.resume()
+        resumePlaybackWaitersIfReady()
     }
 
     func waitUntilPendingPlaybackSequences(_ expected: [UInt64]) async {
@@ -1728,7 +1873,10 @@ private final class SessionBlockingStartDeviceEngineBackend:
     func configureVoiceProcessing(
         _ policy: AudioVoiceProcessingPolicy
     ) throws {}
-    func schedulePlayback(_ frame: AudioFrame) async throws {}
+    func schedulePlayback(
+        _ frame: AudioFrame,
+        owner: AudioDevicePlaybackOwner
+    ) async throws {}
     func setOutputMuted(_ muted: Bool) {}
 
     func startCapture(
@@ -1751,7 +1899,7 @@ private final class SessionBlockingStartDeviceEngineBackend:
         }
     }
 
-    func stopPlayback() {
+    func stopPlayback(owner: AudioDevicePlaybackOwner?) {
         stopPlaybackCount += 1
     }
 
@@ -2058,6 +2206,36 @@ private actor SessionControlledSender: AudioFrameSender {
         let continuation = continuation
         self.continuation = nil
         continuation?.resume()
+    }
+}
+
+private actor SessionSourceFanOutGate {
+    private var isSuspended = false
+    private var suspensionWaiters: [CheckedContinuation<Void, Never>] = []
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func suspend() async {
+        isSuspended = true
+        let waiters = suspensionWaiters
+        suspensionWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func waitUntilSuspended() async {
+        guard !isSuspended else { return }
+        await withCheckedContinuation { continuation in
+            suspensionWaiters.append(continuation)
+        }
+    }
+
+    func resume() {
+        continuation?.resume()
+        continuation = nil
     }
 }
 

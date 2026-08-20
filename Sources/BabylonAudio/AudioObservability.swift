@@ -1,3 +1,28 @@
+import Foundation
+
+@available(iOS 18, macOS 13, *)
+final class AudioPipelineEventDeliveryToken: @unchecked Sendable {
+    private let lock = NSLock()
+    private var active = true
+
+    var isActive: Bool {
+        lock.withLock { active }
+    }
+
+    func deactivate() {
+        lock.withLock { active = false }
+    }
+}
+
+@available(iOS 18, macOS 13, *)
+enum AudioPipelineEventDeliveryContext {
+    @TaskLocal static var token: AudioPipelineEventDeliveryToken?
+
+    static var isDirectDelivery: Bool {
+        token?.isActive == true
+    }
+}
+
 public enum AudioFlowStopReason: Equatable, Sendable {
     case consumerRequested
     case replaced

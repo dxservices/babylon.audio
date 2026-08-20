@@ -46,7 +46,10 @@ All notable changes to this project will be documented in this file.
 - Isolate capture ownership so stale frame/failure callbacks and old iOS
   handoff drains cannot clear or stop a replacement capture.
 - Resolve local-monitor and downlink device sinks through the same injected
-  playback-configured engine, with pending-playback termination on flow stop.
+  playback-configured engine, with per-session playback ownership so one flow's
+  stop does not interrupt another session sharing that engine.
+- Revalidate the active source generation and monitor sink after uplink enqueue
+  so stop or endpoint failure cannot deliver a stale monitor frame.
 - Verify local monitor, uplink, and downlink composition under one pipeline
   session, flow identifier, and terminal lifecycle.
 - Add content-free streaming snapshots and diagnostics for queue duration,
@@ -78,6 +81,9 @@ All notable changes to this project will be documented in this file.
   configuration permits, revoke permits when their configuration closure exits,
   and invalidate suspended or superseded queued recovery work as soon as a
   newer safety boundary arrives.
+- Reject direct safety configuration from a pipeline event callback before gate
+  acquisition, while allowing a spawned recovery task to configure after the
+  terminal event barrier completes.
 - Add the shared device-engine safety foundation; output starts muted and can
   only unmute after a safe route evaluation.
 - Add single-tap microphone capture with hardware-native PCM copying, bounded
@@ -89,8 +95,9 @@ All notable changes to this project will be documented in this file.
 - Add exact-format shared-engine PCM playback through `AudioFrameSink`, with
   data-consumed completion handoff and deterministic pending-consume failure on
   playback stop.
-- Rebuild invalid engine and player-node objects after a media-services reset,
-  leaving a fresh stopped, muted, and unconfigured graph before caller delivery.
+- Rebuild invalid engine and playback-owner node objects after a media-services
+  reset, leaving a fresh stopped, muted, and unconfigured graph before caller
+  delivery.
 - Eagerly latch mute for boundary events, serialize device events through
   consumer delivery, and serialize caller configuration against fail-closed
   hardware/session transitions.

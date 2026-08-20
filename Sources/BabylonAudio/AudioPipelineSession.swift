@@ -24,6 +24,16 @@ private struct PendingPipelineStartAttempt {
 }
 
 @available(iOS 18, macOS 13, *)
+private struct AudioDeviceOwnedPlaybackSink: AudioFrameSink {
+    let engine: AudioDeviceEngine
+    let token: AudioDevicePlaybackToken
+
+    func consume(_ frame: AudioFrame) async throws {
+        try await engine.consume(frame, token: token)
+    }
+}
+
+@available(iOS 18, macOS 13, *)
 public actor AudioPipelineSession {
     private let configuration: AudioPipelineConfiguration
     private let deviceEngine: AudioDeviceEngine?
@@ -33,6 +43,7 @@ public actor AudioPipelineSession {
     private let sourceGate = AudioPipelineSerialGate()
     private let safetyBoundaryLatch = AudioPipelineSafetyBoundaryLatch()
     private let startAttemptSuspension: (@Sendable () async -> Void)?
+    private let sourcePostUplinkSuspension: (@Sendable () async -> Void)?
     private let stopWaitObservation: (@Sendable () -> Void)?
 
     private var activeGeneration: AudioFlowGeneration?
@@ -52,7 +63,7 @@ public actor AudioPipelineSession {
     private var state: AudioPipelineState = .idle
     private var usedFlowIDs: Set<AudioFlowID> = []
     private var activeLocalMonitorSink: (any AudioFrameSink)?
-    private var activeUsesDevicePlayback = false
+    private var activePlaybackToken: AudioDevicePlaybackToken?
     private var sourceFormat: AudioStreamFormat?
     private var sourceProcessorChain: AudioFrameProcessorChain?
 
@@ -65,6 +76,7 @@ public actor AudioPipelineSession {
         self.configuration = configuration
         self.deviceEngine = deviceEngine
         startAttemptSuspension = nil
+        sourcePostUplinkSuspension = nil
         stopWaitObservation = nil
         uplink = BoundedUplinkQueue(
             policy: uplinkPolicy,
@@ -83,11 +95,13 @@ public actor AudioPipelineSession {
         uplinkPolicy: BoundedUplinkQueuePolicy = .initial,
         downlinkPolicy: BoundedDownlinkJitterBufferPolicy = .initial,
         startAttemptSuspension: @escaping @Sendable () async -> Void,
+        sourcePostUplinkSuspension: (@Sendable () async -> Void)? = nil,
         stopWaitObservation: (@Sendable () -> Void)? = nil
     ) {
         self.configuration = configuration
         self.deviceEngine = deviceEngine
         self.startAttemptSuspension = startAttemptSuspension
+        self.sourcePostUplinkSuspension = sourcePostUplinkSuspension
         self.stopWaitObservation = stopWaitObservation
         uplink = BoundedUplinkQueue(
             policy: uplinkPolicy,
@@ -209,12 +223,19 @@ public actor AudioPipelineSession {
             safetyRevision: safetyRevision
         )
 
+        let playbackToken = usesDevicePlayback
+            ? await deviceEngine?.makePlaybackToken()
+            : nil
+        let devicePlaybackSink: (any AudioFrameSink)? = playbackToken.map {
+            AudioDeviceOwnedPlaybackSink(engine: deviceEngine!, token: $0)
+        }
+
         let localMonitorSink: (any AudioFrameSink)?
         switch configuration.localMonitorSink {
         case .external(let sink):
             localMonitorSink = sink
         case .device:
-            localMonitorSink = deviceEngine
+            localMonitorSink = devicePlaybackSink
         case nil:
             localMonitorSink = nil
         }
@@ -224,7 +245,7 @@ public actor AudioPipelineSession {
         case .external(let sink):
             downlinkSink = sink
         case .device:
-            downlinkSink = deviceEngine
+            downlinkSink = devicePlaybackSink
         case nil:
             downlinkSink = nil
         }
@@ -241,7 +262,7 @@ public actor AudioPipelineSession {
                 observedNaturalEndDirections = []
                 state = .running
                 activeLocalMonitorSink = localMonitorSink
-                activeUsesDevicePlayback = usesDevicePlayback
+                activePlaybackToken = playbackToken
                 sourceFormat = nil
             }
         ) else {
@@ -539,7 +560,6 @@ public actor AudioPipelineSession {
         }
 
         sourceFormat = frame.format
-        let localMonitorSink = activeLocalMonitorSink
         for processedFrame in processedFrames {
             guard activeGeneration == generation else {
                 await sourceGate.release()
@@ -547,8 +567,15 @@ public actor AudioPipelineSession {
             }
             if configuration.uplinkSender != nil {
                 await uplink.enqueue(processedFrame)
+                await sourcePostUplinkSuspension?()
             }
-            guard let localMonitorSink else { continue }
+            guard activeGeneration == generation else {
+                await sourceGate.release()
+                throw AudioPipelineSessionError.notRunning
+            }
+            guard let localMonitorSink = activeLocalMonitorSink else {
+                continue
+            }
             do {
                 try await localMonitorSink.consume(processedFrame)
             } catch {
@@ -795,8 +822,8 @@ public actor AudioPipelineSession {
         receiverTask = nil
         let captureToken = microphoneCaptureToken
         microphoneCaptureToken = nil
-        let stopsDevicePlayback = activeUsesDevicePlayback
-        activeUsesDevicePlayback = false
+        let playbackToken = activePlaybackToken
+        activePlaybackToken = nil
         let pendingCaptureStart = pendingMicrophoneCaptureStart.flatMap {
             $0.generation == generation ? $0 : nil
         }
@@ -812,8 +839,8 @@ public actor AudioPipelineSession {
             await deviceEngine?.stopCapture(token: acquiredToken)
         }
         clearPendingMicrophoneCaptureStart(generation: generation)
-        if stopsDevicePlayback {
-            await deviceEngine?.stopPlayback()
+        if let playbackToken {
+            await deviceEngine?.stopPlayback(token: playbackToken)
         }
         await uplink.stop()
         if finalStopDownlink {
@@ -864,7 +891,13 @@ public actor AudioPipelineSession {
     private func emit(_ event: AudioEvent) async {
         guard let eventSink = configuration.eventSink else { return }
         await eventGate.acquire()
-        await eventSink.receive(event)
+        let deliveryToken = AudioPipelineEventDeliveryToken()
+        await AudioPipelineEventDeliveryContext.$token.withValue(
+            deliveryToken
+        ) {
+            await eventSink.receive(event)
+        }
+        deliveryToken.deactivate()
         await eventGate.release()
     }
 }

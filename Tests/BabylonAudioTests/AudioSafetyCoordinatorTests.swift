@@ -106,6 +106,73 @@ struct AudioSafetyCoordinatorTests {
         await sender.complete()
     }
 
+    @Test("Pipeline events cannot reenter configuration during safety cleanup")
+    func pipelineEventConfigurationReentryFailsWithoutDeadlock() async throws {
+        let recorder = SafetyActionRecorder()
+        let flowID = AudioFlowID()
+        let pipelineEventSink = SafetyReentrantPipelineEventSink()
+        let pipeline = AudioPipelineSession(
+            configuration: try AudioPipelineConfiguration(
+                source: .externalFrames,
+                localMonitorSink: .external(SafetyRecordingSink()),
+                eventSink: pipelineEventSink
+            )
+        )
+        let coordinator = AudioSafetyCoordinator(
+            hardware: RecordingHardware(recorder: recorder),
+            buffers: AudioPipelineSafetyBufferController(session: pipeline),
+            session: RecordingSafetySession(recorder: recorder),
+            eventSink: RecordingDeviceEventSink(recorder: recorder)
+        )
+        await pipelineEventSink.attach(
+            coordinator: coordinator,
+            session: pipeline
+        )
+        try await pipeline.start(flowID: flowID)
+
+        let result = await coordinator.handle(.interruptionBegan)
+
+        #expect(result.engagedSafetyBoundary)
+        #expect(await pipelineEventSink.configurationErrors == [
+            .configurationDuringPipelineEventDelivery,
+            .configurationDuringPipelineEventDelivery,
+        ])
+        #expect(!(await pipelineEventSink.didRunConfiguration))
+        #expect(await pipeline.snapshot.state == .stopped)
+        #expect(await pipelineEventSink.recoveryConfigurationError == nil)
+        #expect(await pipelineEventSink.didRunRecoveryConfiguration)
+    }
+
+    @Test("Ordinary pipeline events also reject direct configuration reentry")
+    func ordinaryPipelineEventRejectsDirectConfiguration() async throws {
+        let recorder = SafetyActionRecorder()
+        let flowID = AudioFlowID()
+        let pipelineEventSink = SafetyDirectConfigurationEventSink()
+        let pipeline = AudioPipelineSession(
+            configuration: try AudioPipelineConfiguration(
+                source: .externalFrames,
+                localMonitorSink: .external(SafetyRecordingSink()),
+                eventSink: pipelineEventSink
+            )
+        )
+        let coordinator = AudioSafetyCoordinator(
+            hardware: RecordingHardware(recorder: recorder),
+            buffers: RecordingBuffers(recorder: recorder),
+            session: RecordingSafetySession(recorder: recorder),
+            eventSink: RecordingDeviceEventSink(recorder: recorder)
+        )
+        await pipelineEventSink.attach(coordinator: coordinator)
+
+        try await pipeline.start(flowID: flowID)
+
+        #expect(await pipelineEventSink.configurationErrors == [
+            .configurationDuringPipelineEventDelivery,
+            .configurationDuringPipelineEventDelivery,
+        ])
+        #expect(!(await pipelineEventSink.didRunConfiguration))
+        await pipeline.stop()
+    }
+
     @Test("Media reset rebuilds before delivery even if deactivation fails")
     func mediaResetRebuildsBeforeDelivery() async {
         let recorder = SafetyActionRecorder()
@@ -587,6 +654,118 @@ private struct SafetyPipelineEventSink: AudioEventSink {
     }
 }
 
+private actor SafetyDirectConfigurationEventSink: AudioEventSink {
+    private weak var coordinator: AudioSafetyCoordinator?
+    private(set) var configurationErrors: [AudioSafetyCoordinatorError] = []
+    private(set) var didRunConfiguration = false
+
+    func attach(coordinator: AudioSafetyCoordinator) {
+        self.coordinator = coordinator
+    }
+
+    func receive(_ event: AudioEvent) async {
+        guard case .flowStarted = event, let coordinator else { return }
+        do {
+            try await coordinator.performConfiguration {
+                await self.recordConfigurationRun()
+            }
+        } catch let error as AudioSafetyCoordinatorError {
+            configurationErrors.append(error)
+        } catch {
+            Issue.record("Unexpected configuration error")
+        }
+        do {
+            try await coordinator.performConfiguration { _ in
+                await self.recordConfigurationRun()
+            }
+        } catch let error as AudioSafetyCoordinatorError {
+            configurationErrors.append(error)
+        } catch {
+            Issue.record("Unexpected permit configuration error")
+        }
+    }
+
+    private func recordConfigurationRun() {
+        didRunConfiguration = true
+    }
+}
+
+private actor SafetyReentrantPipelineEventSink: AudioEventSink {
+    private weak var coordinator: AudioSafetyCoordinator?
+    private weak var session: AudioPipelineSession?
+    private(set) var configurationErrors: [AudioSafetyCoordinatorError] = []
+    private(set) var didRunConfiguration = false
+    private var didRunRecoveryConfigurationValue = false
+    private var recoveryTask: Task<AudioSafetyCoordinatorError?, Never>?
+
+    func attach(
+        coordinator: AudioSafetyCoordinator,
+        session: AudioPipelineSession
+    ) {
+        self.coordinator = coordinator
+        self.session = session
+    }
+
+    func receive(_ event: AudioEvent) async {
+        guard case .flowStopped = event, let coordinator else { return }
+        do {
+            try await coordinator.performConfiguration {
+                await self.recordConfigurationRun()
+            }
+        } catch let error as AudioSafetyCoordinatorError {
+            configurationErrors.append(error)
+        } catch {
+            Issue.record("Unexpected configuration error")
+        }
+        do {
+            try await coordinator.performConfiguration { _ in
+                await self.recordConfigurationRun()
+            }
+        } catch let error as AudioSafetyCoordinatorError {
+            configurationErrors.append(error)
+        } catch {
+            Issue.record("Unexpected permit configuration error")
+        }
+        let session = self.session
+        recoveryTask = Task { [weak coordinator, weak session] in
+            await session?.stop()
+            guard let coordinator else { return nil }
+            do {
+                try await coordinator.performConfiguration { _ in
+                    await self.recordRecoveryConfigurationRun()
+                }
+                return nil
+            } catch let error as AudioSafetyCoordinatorError {
+                return error
+            } catch {
+                Issue.record("Unexpected recovery configuration error")
+                return nil
+            }
+        }
+    }
+
+    private func recordConfigurationRun() {
+        didRunConfiguration = true
+    }
+
+    var recoveryConfigurationError: AudioSafetyCoordinatorError? {
+        get async {
+            await recoveryTask?.value
+        }
+    }
+
+    var didRunRecoveryConfiguration: Bool {
+        get async {
+            _ = await recoveryTask?.value
+            return didRunRecoveryConfigurationValue
+        }
+    }
+
+    private func recordRecoveryConfigurationRun() {
+        didRunRecoveryConfigurationValue = true
+    }
+}
+
 private func eventuallySafety(
     _ predicate: @escaping @Sendable () async -> Bool
 ) async -> Bool {
@@ -825,7 +1004,10 @@ private final class PermitEngineBackend: AudioDeviceEngineBackend {
     func configureVoiceProcessing(
         _ policy: AudioVoiceProcessingPolicy
     ) throws {}
-    func schedulePlayback(_ frame: AudioFrame) async throws {}
+    func schedulePlayback(
+        _ frame: AudioFrame,
+        owner: AudioDevicePlaybackOwner
+    ) async throws {}
     func setOutputMuted(_ muted: Bool) {
         if !muted {
             unmuteCount += 1
@@ -837,7 +1019,7 @@ private final class PermitEngineBackend: AudioDeviceEngineBackend {
         onFailure: AudioCaptureFailureHandler?
     ) throws {}
     func stopCapture() {}
-    func stopPlayback() {}
+    func stopPlayback(owner: AudioDevicePlaybackOwner?) {}
     func rebuildAfterMediaServicesReset() {}
 }
 

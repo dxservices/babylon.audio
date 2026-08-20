@@ -163,6 +163,21 @@ struct AudioDeviceCaptureToken: Equatable, Sendable {
 }
 
 @available(iOS 18, macOS 13, *)
+struct AudioDevicePlaybackToken: Hashable, Sendable {
+    fileprivate let id: UUID
+
+    fileprivate init() {
+        id = UUID()
+    }
+}
+
+@available(iOS 18, macOS 13, *)
+enum AudioDevicePlaybackOwner: Hashable, Sendable {
+    case publicSink
+    case token(AudioDevicePlaybackToken)
+}
+
+@available(iOS 18, macOS 13, *)
 @MainActor
 protocol AudioDeviceEngineBackend: AnyObject {
     func start() throws
@@ -171,7 +186,10 @@ protocol AudioDeviceEngineBackend: AnyObject {
     func configureVoiceProcessing(
         _ policy: AudioVoiceProcessingPolicy
     ) throws
-    func schedulePlayback(_ frame: AudioFrame) async throws
+    func schedulePlayback(
+        _ frame: AudioFrame,
+        owner: AudioDevicePlaybackOwner
+    ) async throws
     func setOutputMuted(_ muted: Bool)
     func startCapture(
         configuration: AudioCaptureConfiguration,
@@ -179,7 +197,7 @@ protocol AudioDeviceEngineBackend: AnyObject {
         onFailure: AudioCaptureFailureHandler?
     ) throws
     func stopCapture()
-    func stopPlayback()
+    func stopPlayback(owner: AudioDevicePlaybackOwner?)
     func rebuildAfterMediaServicesReset()
 }
 
@@ -228,6 +246,20 @@ public final class AudioDeviceEngine:
     }
 
     public func consume(_ frame: AudioFrame) async throws {
+        try await consume(frame, owner: .publicSink)
+    }
+
+    func consume(
+        _ frame: AudioFrame,
+        token: AudioDevicePlaybackToken
+    ) async throws {
+        try await consume(frame, owner: .token(token))
+    }
+
+    private func consume(
+        _ frame: AudioFrame,
+        owner: AudioDevicePlaybackOwner
+    ) async throws {
         guard isRunning else {
             throw AudioDeviceEngineError.engineNotRunning
         }
@@ -237,7 +269,7 @@ public final class AudioDeviceEngine:
         guard frame.format == playbackFormat else {
             throw AudioDeviceEngineError.playbackFormatMismatch
         }
-        try await backend.schedulePlayback(frame)
+        try await backend.schedulePlayback(frame, owner: owner)
     }
 
     public func stop() {
@@ -328,7 +360,15 @@ public final class AudioDeviceEngine:
     }
 
     public func stopPlayback() {
-        backend.stopPlayback()
+        backend.stopPlayback(owner: nil)
+    }
+
+    func makePlaybackToken() -> AudioDevicePlaybackToken {
+        AudioDevicePlaybackToken()
+    }
+
+    func stopPlayback(token: AudioDevicePlaybackToken) {
+        backend.stopPlayback(owner: .token(token))
     }
 
     /// Replaces the graph invalidated by `mediaServicesWereReset`.
@@ -368,21 +408,24 @@ public extension AudioDeviceEngine {
 @MainActor
 private final class AVAudioDeviceEngineBackend: AudioDeviceEngineBackend {
     private var engine: AVAudioEngine
-    private var playerNode: AVAudioPlayerNode
     private var playbackFormat: AudioStreamFormat?
     private var playbackAVFormat: AVAudioFormat?
+    private var outputIsMuted = true
+    private var playbackNodes:
+        [AudioDevicePlaybackOwner: AVAudioPlayerNode] = [:]
     /// Monotonic across graph rebuilds so late completions cannot collide.
     private var nextPlaybackID: UInt64 = 0
-    private var playbackCompletions:
-        [UInt64: AudioPlaybackCompletionBridge] = [:]
+    private struct PendingPlayback {
+        let owner: AudioDevicePlaybackOwner
+        let completion: AudioPlaybackCompletionBridge
+    }
+    private var playbackCompletions: [UInt64: PendingPlayback] = [:]
     private var captureTapInstalled = false
     private var captureBridge: BoundedAudioCaptureBridge?
     private var captureTask: Task<Void, Never>?
 
     init() {
-        let graph = Self.makeGraph()
-        engine = graph.engine
-        playerNode = graph.playerNode
+        engine = AVAudioEngine()
     }
 
     func start() throws {
@@ -392,7 +435,7 @@ private final class AVAudioDeviceEngineBackend: AudioDeviceEngineBackend {
 
     func stop() {
         stopCapture()
-        stopPlayback()
+        stopPlayback(owner: nil)
         engine.stop()
     }
 
@@ -402,8 +445,7 @@ private final class AVAudioDeviceEngineBackend: AudioDeviceEngineBackend {
         else {
             throw AudioDeviceEngineError.invalidPlaybackBuffer
         }
-        engine.disconnectNodeOutput(playerNode)
-        engine.connect(playerNode, to: engine.mainMixerNode, format: avFormat)
+        stopPlayback(owner: nil)
         playbackFormat = format
         playbackAVFormat = avFormat
     }
@@ -417,7 +459,10 @@ private final class AVAudioDeviceEngineBackend: AudioDeviceEngineBackend {
         try engine.inputNode.setVoiceProcessingEnabled(policy != .disabled)
     }
 
-    func schedulePlayback(_ frame: AudioFrame) async throws {
+    func schedulePlayback(
+        _ frame: AudioFrame,
+        owner: AudioDevicePlaybackOwner
+    ) async throws {
         guard frame.format == playbackFormat,
               let playbackAVFormat,
               let buffer = try? Self.makePlaybackBuffer(
@@ -432,7 +477,11 @@ private final class AVAudioDeviceEngineBackend: AudioDeviceEngineBackend {
         let playbackID = nextPlaybackID
         nextPlaybackID += 1
         let completion = AudioPlaybackCompletionBridge()
-        playbackCompletions[playbackID] = completion
+        let playerNode = playbackNode(for: owner, format: playbackAVFormat)
+        playbackCompletions[playbackID] = PendingPlayback(
+            owner: owner,
+            completion: completion
+        )
         playerNode.scheduleBuffer(
             buffer,
             completionCallbackType: .dataConsumed
@@ -454,9 +503,12 @@ private final class AVAudioDeviceEngineBackend: AudioDeviceEngineBackend {
     }
 
     func setOutputMuted(_ muted: Bool) {
-        playerNode.volume = muted ? 0 : 1
-        if !muted, engine.isRunning, !playerNode.isPlaying {
-            playerNode.play()
+        outputIsMuted = muted
+        for playerNode in playbackNodes.values {
+            playerNode.volume = muted ? 0 : 1
+            if !muted, engine.isRunning, !playerNode.isPlaying {
+                playerNode.play()
+            }
         }
     }
 
@@ -553,25 +605,36 @@ private final class AVAudioDeviceEngineBackend: AudioDeviceEngineBackend {
         captureTask = nil
     }
 
-    func stopPlayback() {
-        let pending = Array(playbackCompletions.values)
-        playbackCompletions.removeAll()
-        for completion in pending {
-            completion.cancel()
+    func stopPlayback(owner: AudioDevicePlaybackOwner?) {
+        let matchingIDs = playbackCompletions.compactMap { id, pending in
+            owner == nil || pending.owner == owner ? id : nil
         }
-        playerNode.stop()
+        for id in matchingIDs {
+            playbackCompletions.removeValue(forKey: id)?.completion.cancel()
+        }
+
+        let matchingOwners = playbackNodes.keys.filter {
+            owner == nil || $0 == owner
+        }
+        for matchingOwner in matchingOwners {
+            guard let playerNode = playbackNodes.removeValue(
+                forKey: matchingOwner
+            ) else { continue }
+            playerNode.stop()
+            engine.disconnectNodeOutput(playerNode)
+            engine.detach(playerNode)
+        }
     }
 
     func rebuildAfterMediaServicesReset() {
         stopCapture()
-        stopPlayback()
+        stopPlayback(owner: nil)
         engine.stop()
 
-        let graph = Self.makeGraph()
-        engine = graph.engine
-        playerNode = graph.playerNode
+        engine = AVAudioEngine()
         playbackFormat = nil
         playbackAVFormat = nil
+        outputIsMuted = true
     }
 
     private func stopCaptureAfterFailure(
@@ -582,15 +645,19 @@ private final class AVAudioDeviceEngineBackend: AudioDeviceEngineBackend {
         return true
     }
 
-    private static func makeGraph() -> (
-        engine: AVAudioEngine,
-        playerNode: AVAudioPlayerNode
-    ) {
-        let engine = AVAudioEngine()
+    private func playbackNode(
+        for owner: AudioDevicePlaybackOwner,
+        format: AVAudioFormat
+    ) -> AVAudioPlayerNode {
+        if let playerNode = playbackNodes[owner] {
+            return playerNode
+        }
         let playerNode = AVAudioPlayerNode()
         engine.attach(playerNode)
-        playerNode.volume = 0
-        return (engine, playerNode)
+        engine.connect(playerNode, to: engine.mainMixerNode, format: format)
+        playerNode.volume = outputIsMuted ? 0 : 1
+        playbackNodes[owner] = playerNode
+        return playerNode
     }
 
     private nonisolated static func makeAudioStreamFormat(
