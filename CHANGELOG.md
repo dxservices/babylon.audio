@@ -96,6 +96,8 @@ All notable changes to this project will be documented in this file.
 - Reject direct safety configuration from a pipeline event callback before gate
   acquisition, while allowing a spawned recovery task to configure after the
   terminal event barrier completes.
+- Reject direct pipeline-session replacement from a pipeline event callback,
+  while allowing a spawned task to replace after the old terminal barrier.
 - Add the shared device-engine safety foundation; output starts muted and can
   only unmute after a safe route evaluation.
 - Add single-tap microphone capture with hardware-native PCM copying, bounded
@@ -107,6 +109,9 @@ All notable changes to this project will be documented in this file.
 - Add exact-format shared-engine PCM playback through `AudioFrameSink`, with
   data-consumed completion handoff and deterministic pending-consume failure on
   playback stop.
+- Tombstone stopped playback owners at the shared-engine boundary so a late
+  main-actor consume cannot recreate backend playback state or emit tail audio,
+  without interrupting another active owner.
 - Rebuild invalid engine and playback-owner node objects after a media-services
   reset, leaving a fresh stopped, muted, and unconfigured graph before caller
   delivery.

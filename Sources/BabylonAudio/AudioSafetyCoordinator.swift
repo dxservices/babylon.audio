@@ -58,6 +58,7 @@ public enum AudioPipelineSafetyBufferControllerError:
     Sendable
 {
     case replacementDuringSafetyBoundary
+    case replacementDuringPipelineEventDelivery
     case supersededReplacement
 }
 
@@ -151,6 +152,10 @@ public final class AudioPipelineSafetyBufferController:
     public func replaceSession(
         _ replacement: AudioPipelineSession
     ) async throws {
+        guard !AudioPipelineEventDeliveryContext.isDirectDelivery else {
+            throw AudioPipelineSafetyBufferControllerError
+                .replacementDuringPipelineEventDelivery
+        }
         try Task.checkCancellation()
         guard replacement !== session else { return }
         guard activeDiscardCount == 0, latchedClaims.isEmpty else {

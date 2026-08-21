@@ -216,6 +216,7 @@ public final class AudioDeviceEngine:
 
     private let backend: any AudioDeviceEngineBackend
     private var activeCaptureToken: AudioDeviceCaptureToken?
+    private var activePlaybackTokens: Set<AudioDevicePlaybackToken> = []
 
     init(backend: any AudioDeviceEngineBackend) {
         self.backend = backend
@@ -269,6 +270,11 @@ public final class AudioDeviceEngine:
         guard frame.format == playbackFormat else {
             throw AudioDeviceEngineError.playbackFormatMismatch
         }
+        if case .token(let token) = owner {
+            guard activePlaybackTokens.contains(token) else {
+                throw AudioDeviceEngineError.playbackStopped
+            }
+        }
         try await backend.schedulePlayback(frame, owner: owner)
     }
 
@@ -277,6 +283,7 @@ public final class AudioDeviceEngine:
         muteOutput()
         backend.stop()
         activeCaptureToken = nil
+        activePlaybackTokens.removeAll(keepingCapacity: true)
         isCapturing = false
         isRunning = false
     }
@@ -360,14 +367,18 @@ public final class AudioDeviceEngine:
     }
 
     public func stopPlayback() {
+        activePlaybackTokens.removeAll(keepingCapacity: true)
         backend.stopPlayback(owner: nil)
     }
 
     func makePlaybackToken() -> AudioDevicePlaybackToken {
-        AudioDevicePlaybackToken()
+        let token = AudioDevicePlaybackToken()
+        activePlaybackTokens.insert(token)
+        return token
     }
 
     func stopPlayback(token: AudioDevicePlaybackToken) {
+        activePlaybackTokens.remove(token)
         backend.stopPlayback(owner: .token(token))
     }
 
@@ -382,6 +393,7 @@ public final class AudioDeviceEngine:
         isOutputMuted = true
         isCapturing = false
         activeCaptureToken = nil
+        activePlaybackTokens.removeAll(keepingCapacity: true)
         playbackFormat = nil
         voiceProcessingPolicy = .disabled
     }

@@ -147,6 +147,51 @@ struct AudioDeviceEngineTests {
         #expect(backend.pendingPlaybackSequences.isEmpty)
     }
 
+    @Test("Stopped playback owner rejects a late consume without affecting its replacement")
+    func stoppedPlaybackOwnerCannotBeResurrected() async throws {
+        let format = try AudioStreamFormat.monoPCM16(sampleRate: 24_000)
+        let backend = RecordingDeviceEngineBackend()
+        let engine = AudioDeviceEngine(backend: backend)
+        try engine.configurePlayback(format: format)
+        try engine.start()
+        let staleFrame = try makePlaybackFrame(format: format, sequence: 80)
+        let replacementFrame = try makePlaybackFrame(
+            format: format,
+            sequence: 81
+        )
+        let staleToken = engine.makePlaybackToken()
+        let replacementToken = engine.makePlaybackToken()
+        let suspension = PlaybackConsumeSuspension()
+
+        let staleConsumption = Task { @MainActor in
+            await suspension.suspend()
+            try await engine.consume(staleFrame, token: staleToken)
+        }
+        await suspension.waitUntilSuspended()
+        engine.stopPlayback(token: staleToken)
+
+        let replacementConsumption = Task { @MainActor in
+            try await engine.consume(
+                replacementFrame,
+                token: replacementToken
+            )
+        }
+        for _ in 0..<10 { await Task.yield() }
+        #expect(backend.pendingPlaybackSequences == [81])
+
+        suspension.resume()
+        await #expect(throws: AudioDeviceEngineError.playbackStopped) {
+            try await staleConsumption.value
+        }
+        #expect(backend.actions.filter {
+            if case .schedulePlayback(80) = $0 { return true }
+            return false
+        }.isEmpty)
+
+        backend.completePlayback(sequence: 81)
+        try await replacementConsumption.value
+    }
+
     @Test("Capture callback overflow becomes a visible bounded failure")
     func captureCallbackOverflowIsVisible() async {
         let bridge = BoundedAudioCaptureBridge(capacity: 2)
@@ -402,6 +447,7 @@ private final class RecordingDeviceEngineBackend: AudioDeviceEngineBackend {
     private var captureFailureHandlers: [AudioCaptureFailureHandler?] = []
     private var playbackContinuations:
         [UInt64: CheckedContinuation<Void, any Error>] = [:]
+    private var playbackOwners: [UInt64: AudioDevicePlaybackOwner] = [:]
 
     var pendingPlaybackSequences: [UInt64] {
         playbackContinuations.keys.sorted()
@@ -436,10 +482,12 @@ private final class RecordingDeviceEngineBackend: AudioDeviceEngineBackend {
         actions.append(.schedulePlayback(frame.sequence))
         try await withCheckedThrowingContinuation { continuation in
             playbackContinuations[frame.sequence] = continuation
+            playbackOwners[frame.sequence] = owner
         }
     }
 
     func completePlayback(sequence: UInt64) {
+        playbackOwners.removeValue(forKey: sequence)
         playbackContinuations.removeValue(forKey: sequence)?.resume()
     }
 
@@ -467,8 +515,13 @@ private final class RecordingDeviceEngineBackend: AudioDeviceEngineBackend {
 
     func stopPlayback(owner: AudioDevicePlaybackOwner?) {
         actions.append(.stopPlayback)
-        let pending = Array(playbackContinuations.values)
-        playbackContinuations.removeAll()
+        let sequences = playbackContinuations.keys.filter {
+            owner == nil || playbackOwners[$0] == owner
+        }
+        let pending = sequences.compactMap { sequence in
+            playbackOwners.removeValue(forKey: sequence)
+            return playbackContinuations.removeValue(forKey: sequence)
+        }
         for continuation in pending {
             continuation.resume(throwing: AudioDeviceEngineError.playbackStopped)
         }
@@ -478,9 +531,41 @@ private final class RecordingDeviceEngineBackend: AudioDeviceEngineBackend {
         actions.append(.rebuildMediaServicesGraph)
         let pending = Array(playbackContinuations.values)
         playbackContinuations.removeAll()
+        playbackOwners.removeAll()
         for continuation in pending {
             continuation.resume(throwing: AudioDeviceEngineError.playbackStopped)
         }
+    }
+}
+
+@MainActor
+private final class PlaybackConsumeSuspension {
+    private var isSuspended = false
+    private var suspendedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func suspend() async {
+        isSuspended = true
+        let waiters = suspendedWaiters
+        suspendedWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func waitUntilSuspended() async {
+        guard !isSuspended else { return }
+        await withCheckedContinuation { continuation in
+            suspendedWaiters.append(continuation)
+        }
+    }
+
+    func resume() {
+        continuation?.resume()
+        continuation = nil
     }
 }
 

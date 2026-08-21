@@ -111,7 +111,12 @@ The coordinator detects direct pipeline-event delivery and throws
 first waits for the session terminal barrier. The delivery-context marker is
 revoked when the callback returns, including in a child task that inherited the
 marker, so that recovery task can then wait for the coordinator transition and
-configure normally. Each flow identifier is single-use within one
+configure normally. `AudioPipelineSafetyBufferController.replaceSession`
+applies the same fail-fast rule and throws
+`replacementDuringPipelineEventDelivery`, even if the callback task is already
+cancelled; a child task must first wait for the old session's terminal barrier
+before replacing it. Each flow identifier is
+single-use within one
 session instance, so a late completion can never match a later generation that
 happens to reuse the same identifier. A successful `start()` return does not
 guarantee that `flowStarted` was delivered: a concurrent consumer stop may win
@@ -287,7 +292,10 @@ invalidated before `flowStarted` throws the content-free
 Because the coordinator has already stopped the shared hardware by the cleanup
 phase, the session may issue the same capture or playback stop again; the shared
 engine's ownership checks and stop operations make that duplication safe and
-prevent stale callbacks from reviving an old generation.
+prevent stale callbacks from reviving an old generation. A stopped playback
+owner is tombstoned at the engine boundary: a consume that reaches the main
+actor after its owner was stopped fails with `playbackStopped` before touching
+the backend, while other active owners continue independently.
 
 A consumer that rebuilds immutable pipeline configurations may retain the same
 coordinator and call `await buffers.replaceSession(replacement)`. Replacement

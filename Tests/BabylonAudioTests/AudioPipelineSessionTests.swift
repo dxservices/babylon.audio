@@ -1214,6 +1214,96 @@ struct AudioPipelineSessionTests {
         #expect(safetySnapshot.endpoints.uplink == .stopped)
     }
 
+    @Test("Pipeline event delivery rejects direct safety-buffer replacement")
+    func pipelineEventReplacementReentryFailsWithoutDeadlock() async throws {
+        let oldFlowID = AudioFlowID()
+        let replacementFlowID = AudioFlowID()
+        let events = SessionReentrantReplacementEventSink()
+        let oldSession = AudioPipelineSession(
+            configuration: try AudioPipelineConfiguration(
+                source: .externalFrames,
+                uplinkSender: SessionRecordingSender(),
+                eventSink: events
+            )
+        )
+        let replacementSession = AudioPipelineSession(
+            configuration: try AudioPipelineConfiguration(
+                source: .externalFrames,
+                uplinkSender: SessionRecordingSender()
+            )
+        )
+        let safetyBuffers = await MainActor.run {
+            AudioPipelineSafetyBufferController(session: oldSession)
+        }
+        await events.attach(
+            controller: safetyBuffers,
+            oldSession: oldSession,
+            replacementSession: replacementSession
+        )
+
+        try await oldSession.start(flowID: oldFlowID)
+        await oldSession.stop()
+
+        #expect(await eventuallySession {
+            await events.recoveryDidReplaceSession
+        })
+        #expect(await events.directErrors == [
+            .replacementDuringPipelineEventDelivery,
+            .replacementDuringPipelineEventDelivery,
+        ])
+
+        try await replacementSession.start(flowID: replacementFlowID)
+        await safetyBuffers.discardPendingAudio()
+        #expect(await replacementSession.snapshot.state == .stopped)
+    }
+
+    @Test("Direct event replacement wins over cancellation while ordinary cancellation remains visible")
+    func replacementReentryPrecedesCancellation() async throws {
+        let flowID = AudioFlowID()
+        let events = SessionCancelledReplacementEventSink()
+        let oldSession = AudioPipelineSession(
+            configuration: try AudioPipelineConfiguration(
+                source: .externalFrames,
+                uplinkSender: SessionRecordingSender(),
+                eventSink: events
+            )
+        )
+        let replacementSession = AudioPipelineSession(
+            configuration: try AudioPipelineConfiguration(
+                source: .externalFrames,
+                uplinkSender: SessionRecordingSender()
+            )
+        )
+        let safetyBuffers = await MainActor.run {
+            AudioPipelineSafetyBufferController(session: oldSession)
+        }
+        await events.attach(
+            controller: safetyBuffers,
+            replacementSession: replacementSession
+        )
+
+        let start = Task {
+            try await oldSession.start(flowID: flowID)
+        }
+        try await start.value
+        #expect(await events.directError
+            == .replacementDuringPipelineEventDelivery)
+        #expect(await events.callbackDidReturn)
+
+        await oldSession.stop()
+        #expect(await oldSession.snapshot.state == .stopped)
+
+        let ordinaryCancelledReplacement = Task {
+            withUnsafeCurrentTask { task in
+                task?.cancel()
+            }
+            try await safetyBuffers.replaceSession(replacementSession)
+        }
+        await #expect(throws: CancellationError.self) {
+            try await ordinaryCancelledReplacement.value
+        }
+    }
+
     @Test("Safety claim racing replacement stays paired with old session and fails replacement closed")
     func safetyClaimWinsSuspendedSessionReplacement() async throws {
         let oldFlowID = AudioFlowID()
@@ -2807,6 +2897,91 @@ private actor SessionRecordingEventSink: AudioEventSink {
 
     func values() -> [AudioEvent] {
         events
+    }
+}
+
+private actor SessionReentrantReplacementEventSink: AudioEventSink {
+    private weak var controller: AudioPipelineSafetyBufferController?
+    private weak var oldSession: AudioPipelineSession?
+    private weak var replacementSession: AudioPipelineSession?
+    private(set) var directErrors:
+        [AudioPipelineSafetyBufferControllerError] = []
+    private(set) var recoveryDidReplaceSession = false
+    private var recoveryTask: Task<Void, Never>?
+
+    func attach(
+        controller: AudioPipelineSafetyBufferController,
+        oldSession: AudioPipelineSession,
+        replacementSession: AudioPipelineSession
+    ) {
+        self.controller = controller
+        self.oldSession = oldSession
+        self.replacementSession = replacementSession
+    }
+
+    func receive(_ event: AudioEvent) async {
+        guard let controller, let replacementSession else { return }
+        do {
+            try await controller.replaceSession(replacementSession)
+            Issue.record("Expected direct replacement reentry to fail")
+        } catch let error as AudioPipelineSafetyBufferControllerError {
+            directErrors.append(error)
+        } catch {
+            Issue.record("Unexpected direct replacement error: \(error)")
+        }
+
+        guard case .flowStopped = event, recoveryTask == nil else { return }
+        let oldSession = self.oldSession
+        recoveryTask = Task { [weak self] in
+            await oldSession?.stop()
+            do {
+                try await controller.replaceSession(replacementSession)
+                await self?.recordRecoverySuccess()
+            } catch {
+                Issue.record("Deferred replacement unexpectedly failed: \(error)")
+            }
+        }
+    }
+
+    private func recordRecoverySuccess() {
+        recoveryDidReplaceSession = true
+    }
+}
+
+private actor SessionCancelledReplacementEventSink: AudioEventSink {
+    private weak var controller: AudioPipelineSafetyBufferController?
+    private weak var replacementSession: AudioPipelineSession?
+    private(set) var directError:
+        AudioPipelineSafetyBufferControllerError?
+    private(set) var callbackDidReturn = false
+
+    func attach(
+        controller: AudioPipelineSafetyBufferController,
+        replacementSession: AudioPipelineSession
+    ) {
+        self.controller = controller
+        self.replacementSession = replacementSession
+    }
+
+    func receive(_ event: AudioEvent) async {
+        guard case .flowStarted = event,
+              let controller,
+              let replacementSession
+        else {
+            return
+        }
+        withUnsafeCurrentTask { task in
+            task?.cancel()
+        }
+        do {
+            try await controller.replaceSession(replacementSession)
+            Issue.record("Expected cancelled direct replacement to fail")
+        } catch let error as AudioPipelineSafetyBufferControllerError {
+            directError = error
+        } catch {
+            Issue.record("Unexpected cancelled direct replacement error: \(error)")
+        }
+        callbackDidReturn = true
     }
 }
 

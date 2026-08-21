@@ -319,6 +319,9 @@ public actor AudioPipelineSession {
             }
         ) else {
             clearPendingStartAttempt(generation: generation)
+            if let playbackToken {
+                await deviceEngine?.stopPlayback(token: playbackToken)
+            }
             throw AudioPipelineSessionError.startCancelledBySafetyBoundary
         }
         if let sender = configuration.uplinkSender {
