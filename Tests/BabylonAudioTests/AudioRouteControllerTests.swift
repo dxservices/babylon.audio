@@ -30,6 +30,8 @@ struct AudioRouteControllerTests {
             .activate(.builtInMicrophoneWithPrivateOutput),
             .deactivate,
         ])
+        #expect(backend.configurationBeginCount == 1)
+        #expect(backend.configurationEndCount == 1)
     }
 
     @Test("Explicit duplex policy falls back from A2DP profile to HFP")
@@ -97,6 +99,8 @@ struct AudioRouteControllerTests {
             .activate(.builtInMicrophoneWithPrivateOutput),
             .deactivate,
         ])
+        #expect(backend.configurationBeginCount == 1)
+        #expect(backend.configurationEndCount == 1)
     }
 
     @Test("Activation failure deactivates and rethrows the original error")
@@ -126,6 +130,8 @@ struct AudioRouteControllerTests {
             .activate(.builtInMicrophoneWithPrivateOutput),
             .deactivate,
         ])
+        #expect(backend.configurationBeginCount == 1)
+        #expect(backend.configurationEndCount == 1)
     }
 
     @Test("Stable unsafe routes use the configured confirmation threshold")
@@ -283,6 +289,8 @@ private final class RecordingAudioSessionBackend: AudioSessionControlling {
 
     private(set) var routeSnapshot: AudioRouteSnapshot = .empty
     private(set) var actions: [Action] = []
+    private(set) var configurationBeginCount = 0
+    private(set) var configurationEndCount = 0
 
     private let builtInRoute: AudioRouteSnapshot
     private let duplexRoute: AudioRouteSnapshot
@@ -296,6 +304,14 @@ private final class RecordingAudioSessionBackend: AudioSessionControlling {
         self.builtInRoute = builtInRoute
         self.duplexRoute = duplexRoute
         self.activationError = activationError
+    }
+
+    func beginManagedRouteConfiguration() {
+        configurationBeginCount += 1
+    }
+
+    func endManagedRouteConfiguration() {
+        configurationEndCount += 1
     }
 
     func activate(_ profile: AudioSessionProfile) throws {

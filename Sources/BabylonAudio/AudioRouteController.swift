@@ -20,9 +20,17 @@ public struct AudioRouteConfigurationResult: Equatable, Sendable {
 protocol AudioSessionControlling: AnyObject {
     var routeSnapshot: AudioRouteSnapshot { get }
 
+    func beginManagedRouteConfiguration()
+    func endManagedRouteConfiguration()
     func activate(_ profile: AudioSessionProfile) throws
     func deactivate() throws
     func selectPrivateAccessoryInput(id: String) throws -> Bool
+}
+
+@available(iOS 18, macOS 13, *)
+extension AudioSessionControlling {
+    func beginManagedRouteConfiguration() {}
+    func endManagedRouteConfiguration() {}
 }
 
 @available(iOS 18, macOS 13, *)
@@ -54,6 +62,8 @@ public final class AudioRouteController {
         outputPolicy: DeviceOutputPolicy,
         trustedOutputs: Set<AudioTrustedOutput>
     ) async throws -> AudioRouteConfigurationResult {
+        session.beginManagedRouteConfiguration()
+        defer { session.endManagedRouteConfiguration() }
         let profiles = AudioSessionProfilePolicy.activationOrder(for: inputPolicy)
         var lastRoute = AudioRouteSnapshot.empty
         var lastSafety = AudioRouteSafetyEvaluation.unsafe(

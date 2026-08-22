@@ -222,6 +222,23 @@ The iOS `AudioSessionController.shared` is the package-owned low-level
 `AVAudioSession` adapter; preference success never substitutes for inspecting
 its resulting `routeSnapshot`.
 
+Route notifications caused by this process's own configuration are attributed
+with time-boxed ownership, never route-content matching. While a managed
+configuration window is open (session mutations, and engine or
+voice-processing work performed inside a safety-coordinated configuration),
+every `categoryChange` and `routeConfigurationChange` belongs to that window
+and is reported only through the optional content-free route observation
+handler; it does not recursively enter the safety boundary. After the
+outermost window seals, only notifications that arrive within a short grace
+interval and still describe the sealed route identity count as delayed
+echoes. Everything else is external and fails open into the device event
+handler: device arrivals and departures, overrides, wake, unsuitable-route
+and unknown reasons always deliver immediately and invalidate any pending
+echo attribution, as do interruptions and media-services resets. Ambiguity
+therefore costs at most one idempotent safety rebuild, never a silently
+swallowed external route fact. Observations expose only reason, origin, and
+input/output port kinds, never port identifiers or names.
+
 The built-in-microphone profile exposes `.disabled` voice processing and uses
 the default session mode. Only the explicitly allowed private-accessory-duplex
 profile exposes `.enabledForPrivateAccessoryDuplex` and uses `.voiceChat`.

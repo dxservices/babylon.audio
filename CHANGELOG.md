@@ -77,6 +77,16 @@ All notable changes to this project will be documented in this file.
   stops capture and playback, invalidates both streaming generations,
   deactivates the session, and only then delivers route, interruption, or
   media-reset events.
+- Attribute package-owned route notifications with time-boxed managed
+  configuration windows plus a bounded post-seal echo grace, delivering all
+  other route facts, interruptions, and resets fail-open to the safety
+  handler and reporting managed echoes only as content-free observations.
+- Mark the capture-tap and playback-completion closures nonisolated
+  Sendable so real-device audio-thread callbacks no longer trip the
+  MainActor dispatch-queue assertion inferred from the enclosing type.
+- Expose `outputHardwareIsReady` so consumers can wait out the transient
+  invalid Bluetooth output hardware format after an activation bounce
+  before starting the engine, instead of failing graph initialization.
 - Add a pipeline safety-buffer adapter that terminates an active session with
   `.safetyBoundary`, synchronously claims terminal ownership before hardware
   stop callbacks, awaits pending start/capture attempts plus playback and queue

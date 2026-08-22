@@ -292,6 +292,8 @@ public final class AudioSafetyCoordinator {
         guard isRecoveryOpen else {
             throw AudioSafetyCoordinatorError.recoveryClosed
         }
+        session.beginManagedRouteConfiguration()
+        defer { session.endManagedRouteConfiguration() }
         return try await operation()
     }
 
@@ -316,6 +318,8 @@ public final class AudioSafetyCoordinator {
         guard isRecoveryOpen else {
             throw AudioSafetyCoordinatorError.recoveryClosed
         }
+        session.beginManagedRouteConfiguration()
+        defer { session.endManagedRouteConfiguration() }
         let permit = AudioSafetyConfigurationPermit(
             coordinator: self,
             revision: boundaryRevision
@@ -363,6 +367,8 @@ public final class AudioSafetyCoordinator {
         await buffers.discardPendingAudio()
 
         let sessionDeactivated: Bool
+        session.beginManagedRouteConfiguration()
+        defer { session.endManagedRouteConfiguration() }
         do {
             try session.deactivate()
             sessionDeactivated = true

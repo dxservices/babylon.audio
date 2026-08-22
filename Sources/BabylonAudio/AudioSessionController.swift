@@ -18,9 +18,9 @@ public final class AudioSessionController {
     }
 
     private let audioSession: AVAudioSession
+    private let eventRouter = AudioSessionEventRouter()
+    private var routeAttribution = AudioSessionRouteAttribution()
     nonisolated(unsafe) private var observers: [NSObjectProtocol] = []
-    private var eventHandler:
-        (@MainActor @Sendable (AudioDeviceEvent) async -> Void)?
 
     private init(audioSession: AVAudioSession = .sharedInstance()) {
         self.audioSession = audioSession
@@ -40,10 +40,33 @@ public final class AudioSessionController {
     public func setEventHandler(
         _ handler: (@MainActor @Sendable (AudioDeviceEvent) async -> Void)?
     ) {
-        eventHandler = handler
+        eventRouter.setEventHandler(handler)
+    }
+
+    /// Installs an optional content-free route observer. Observations contain
+    /// only route reasons, ownership classification, and port kinds.
+    public func setRouteObservationHandler(
+        _ handler: (@MainActor @Sendable (AudioRouteChangeObservation) -> Void)?
+    ) {
+        eventRouter.setObservationHandler(handler)
+    }
+
+    func beginManagedRouteConfiguration() {
+        routeAttribution.beginWindow()
+    }
+
+    func endManagedRouteConfiguration() {
+        routeAttribution.endWindow(
+            settledRoute: AudioSessionRouteAttribution.RouteIdentity(
+                currentRouteOnly
+            )
+        )
     }
 
     public func activate(_ profile: AudioSessionProfile) throws {
+        beginManagedRouteConfiguration()
+        defer { endManagedRouteConfiguration() }
+        routeAttribution.noteMutation(.activate)
         try audioSession.setCategory(
             .playAndRecord,
             mode: profile.mode,
@@ -54,6 +77,9 @@ public final class AudioSessionController {
     }
 
     public func deactivate() throws {
+        beginManagedRouteConfiguration()
+        defer { endManagedRouteConfiguration() }
+        routeAttribution.noteMutation(.deactivate)
         try audioSession.setActive(
             false,
             options: .notifyOthersOnDeactivation
@@ -71,6 +97,9 @@ public final class AudioSessionController {
         }) else {
             return false
         }
+        beginManagedRouteConfiguration()
+        defer { endManagedRouteConfiguration() }
+        routeAttribution.noteMutation(.selectPrivateAccessoryInput)
         try audioSession.setPreferredInput(input)
         return true
     }
@@ -80,13 +109,47 @@ public final class AudioSessionController {
             forName: AVAudioSession.routeChangeNotification,
             object: audioSession,
             queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] notification in
+            // No session IPC in the notification callback: classification and
+            // route reads run later on the MainActor so a notification burst
+            // during Bluetooth renegotiation cannot stall the main thread.
+            let reasonValue = notification.userInfo?[
+                AVAudioSessionRouteChangeReasonKey
+            ] as? UInt
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                await self.eventHandler?(.routeChanged(self.routeSnapshot))
+                await self.handleRouteChange(
+                    reason: AudioRouteChangeReason(avReasonValue: reasonValue)
+                )
             }
         }
         observers.append(observer)
+    }
+
+    private func handleRouteChange(reason: AudioRouteChangeReason) async {
+        let currentRoute = currentRouteOnly
+        let origin = routeAttribution.classify(
+            reason: reason,
+            currentRoute: AudioSessionRouteAttribution.RouteIdentity(
+                currentRoute
+            )
+        )
+        // The delivered snapshot includes available inputs; that extra read
+        // happens only for external deliveries, off the suppression path.
+        let route = origin == .external ? routeSnapshot : currentRoute
+        await eventRouter.deliverRouteChange(
+            origin: origin,
+            reason: reason,
+            route: route
+        )
+    }
+
+    private var currentRouteOnly: AudioRouteSnapshot {
+        AudioRouteSnapshot(
+            inputs: audioSession.currentRoute.inputs.map(Self.snapshot),
+            outputs: audioSession.currentRoute.outputs.map(Self.snapshot),
+            availableInputs: []
+        )
     }
 
     private func observeInterruptions() {
@@ -114,16 +177,18 @@ public final class AudioSessionController {
 
                 switch type {
                 case .began:
-                    await self.eventHandler?(.interruptionBegan)
+                    self.routeAttribution.reset()
+                    await self.eventRouter.deliverInterruptionBegan()
                 case .ended:
                     let options = AVAudioSession.InterruptionOptions(
                         rawValue: optionsValue
                     )
-                    await self.eventHandler?(.interruptionEnded(
+                    await self.eventRouter.deliverInterruptionEnded(
                         shouldResume: options.contains(.shouldResume)
-                    ))
+                    )
                 @unknown default:
-                    await self.eventHandler?(.interruptionBegan)
+                    self.routeAttribution.reset()
+                    await self.eventRouter.deliverInterruptionBegan()
                 }
             }
         }
@@ -138,8 +203,9 @@ public final class AudioSessionController {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                activeProfile = nil
-                await eventHandler?(.mediaServicesReset)
+                self.activeProfile = nil
+                self.routeAttribution.reset()
+                await self.eventRouter.deliverMediaServicesReset()
             }
         }
         observers.append(observer)
@@ -177,6 +243,33 @@ private extension AudioSessionProfile {
             } else {
                 [.allowBluetoothHFP]
             }
+        }
+    }
+}
+
+@available(iOS 18, *)
+private extension AudioRouteChangeReason {
+    init(avReasonValue: UInt?) {
+        guard let avReasonValue,
+              let reason = AVAudioSession.RouteChangeReason(
+                rawValue: avReasonValue
+              )
+        else {
+            self = .unknown
+            return
+        }
+        switch reason {
+        case .unknown: self = .unknown
+        case .newDeviceAvailable: self = .newDeviceAvailable
+        case .oldDeviceUnavailable: self = .oldDeviceUnavailable
+        case .categoryChange: self = .categoryChange
+        case .override: self = .override
+        case .wakeFromSleep: self = .wakeFromSleep
+        case .noSuitableRouteForCategory:
+            self = .noSuitableRouteForCategory
+        case .routeConfigurationChange:
+            self = .routeConfigurationChange
+        @unknown default: self = .unknown
         }
     }
 }

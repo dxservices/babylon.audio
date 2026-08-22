@@ -199,6 +199,12 @@ protocol AudioDeviceEngineBackend: AnyObject {
     func stopCapture()
     func stopPlayback(owner: AudioDevicePlaybackOwner?)
     func rebuildAfterMediaServicesReset()
+    var outputHardwareIsReady: Bool { get }
+}
+
+@available(iOS 18, macOS 13, *)
+extension AudioDeviceEngineBackend {
+    var outputHardwareIsReady: Bool { true }
 }
 
 @available(iOS 18, macOS 13, *)
@@ -226,6 +232,15 @@ public final class AudioDeviceEngine:
         guard !isRunning else { return }
         try backend.start()
         isRunning = true
+    }
+
+    /// Whether the output hardware currently reports a valid format. A
+    /// Bluetooth output can report an invalid (0 Hz) format for a short
+    /// window after a session activation bounce; starting the engine inside
+    /// that window fails graph initialization. Callers should wait for
+    /// readiness with a bounded budget before `start()`.
+    public var outputHardwareIsReady: Bool {
+        backend.outputHardwareIsReady
     }
 
     public func configurePlayback(format: AudioStreamFormat) throws {
@@ -445,6 +460,11 @@ private final class AVAudioDeviceEngineBackend: AudioDeviceEngineBackend {
         try engine.start()
     }
 
+    var outputHardwareIsReady: Bool {
+        let format = engine.outputNode.outputFormat(forBus: 0)
+        return format.sampleRate > 0 && format.channelCount > 0
+    }
+
     func stop() {
         stopCapture()
         stopPlayback(owner: nil)
@@ -494,10 +514,14 @@ private final class AVAudioDeviceEngineBackend: AudioDeviceEngineBackend {
             owner: owner,
             completion: completion
         )
+        // The completion runs on the player node's internal queue. Without
+        // the explicit @Sendable the closure literal inherits this class's
+        // MainActor isolation and the runtime queue assertion traps on the
+        // first real-device callback.
         playerNode.scheduleBuffer(
             buffer,
             completionCallbackType: .dataConsumed
-        ) { _ in
+        ) { @Sendable _ in
             completion.consumed()
         }
         if playerNode.volume > 0, engine.isRunning, !playerNode.isPlaying {
@@ -586,11 +610,15 @@ private final class AVAudioDeviceEngineBackend: AudioDeviceEngineBackend {
             }
         }
 
+        // The tap runs on the capture render queue. Without the explicit
+        // @Sendable the closure literal inherits this class's MainActor
+        // isolation and the runtime queue assertion traps on the first
+        // real-device audio callback.
         engine.inputNode.installTap(
             onBus: 0,
             bufferSize: tapBufferFrameCapacity,
             format: tapFormat
-        ) { buffer, _ in
+        ) { @Sendable buffer, _ in
             guard buffer.frameLength <= maximumCallbackFrameCapacity else {
                 bridge.fail(.captureHardwareBufferLimitExceeded)
                 return
