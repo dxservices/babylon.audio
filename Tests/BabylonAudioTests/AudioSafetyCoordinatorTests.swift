@@ -1007,7 +1007,19 @@ private final class PermitEngineBackend: AudioDeviceEngineBackend {
     func schedulePlayback(
         _ frame: AudioFrame,
         owner: AudioDevicePlaybackOwner
-    ) async throws {}
+    ) throws -> AudioDeviceScheduledPlayback {
+        let completion = AudioPlaybackCompletionBridge()
+        completion.consumed()
+        return AudioDeviceScheduledPlayback(
+            sequence: frame.sequence,
+            completion: completion
+        )
+    }
+    func waitForScheduledPlayback(
+        _ playback: AudioDeviceScheduledPlayback
+    ) async throws {
+        _ = await playback.completion.waitUntilConsumed()
+    }
     func setOutputMuted(_ muted: Bool) {
         if !muted {
             unmuteCount += 1

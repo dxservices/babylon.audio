@@ -19,11 +19,18 @@ public final class AudioSessionController {
 
     private let audioSession: AVAudioSession
     private let eventRouter = AudioSessionEventRouter()
-    private var routeAttribution = AudioSessionRouteAttribution()
+    private let routeAttribution: AudioSessionRouteAttribution
     nonisolated(unsafe) private var observers: [NSObjectProtocol] = []
 
-    private init(audioSession: AVAudioSession = .sharedInstance()) {
+    private init(
+        audioSession: AVAudioSession = .sharedInstance(),
+        routeAttribution: AudioSessionRouteAttribution = .shared
+    ) {
         self.audioSession = audioSession
+        self.routeAttribution = routeAttribution
+        routeAttribution.updateKnownRoute(
+            AudioSessionRouteAttribution.RouteIdentity(currentRouteOnly)
+        )
         observeRouteChanges()
         observeInterruptions()
         observeMediaServicesReset()
@@ -52,7 +59,11 @@ public final class AudioSessionController {
     }
 
     func beginManagedRouteConfiguration() {
-        routeAttribution.beginWindow()
+        routeAttribution.beginWindow(
+            initialRoute: AudioSessionRouteAttribution.RouteIdentity(
+                currentRouteOnly
+            )
+        )
     }
 
     func endManagedRouteConfiguration() {
@@ -66,24 +77,26 @@ public final class AudioSessionController {
     public func activate(_ profile: AudioSessionProfile) throws {
         beginManagedRouteConfiguration()
         defer { endManagedRouteConfiguration() }
-        routeAttribution.noteMutation(.activate)
-        try audioSession.setCategory(
-            .playAndRecord,
-            mode: profile.mode,
-            options: profile.categoryOptions
-        )
-        try audioSession.setActive(true)
+        try performManagedRouteMutation(.activate) {
+            try audioSession.setCategory(
+                .playAndRecord,
+                mode: profile.mode,
+                options: profile.categoryOptions
+            )
+            try audioSession.setActive(true)
+        }
         activeProfile = profile
     }
 
     public func deactivate() throws {
         beginManagedRouteConfiguration()
         defer { endManagedRouteConfiguration() }
-        routeAttribution.noteMutation(.deactivate)
-        try audioSession.setActive(
-            false,
-            options: .notifyOthersOnDeactivation
-        )
+        try performManagedRouteMutation(.deactivate) {
+            try audioSession.setActive(
+                false,
+                options: .notifyOthersOnDeactivation
+            )
+        }
         activeProfile = nil
     }
 
@@ -99,37 +112,57 @@ public final class AudioSessionController {
         }
         beginManagedRouteConfiguration()
         defer { endManagedRouteConfiguration() }
-        routeAttribution.noteMutation(.selectPrivateAccessoryInput)
-        try audioSession.setPreferredInput(input)
+        try performManagedRouteMutation(.selectPrivateAccessoryInput) {
+            try audioSession.setPreferredInput(input)
+        }
         return true
     }
 
     private func observeRouteChanges() {
+        let routeAttribution = routeAttribution
         let observer = NotificationCenter.default.addObserver(
             forName: AVAudioSession.routeChangeNotification,
             object: audioSession,
             queue: .main
         ) { [weak self] notification in
-            // No session IPC in the notification callback: classification and
-            // route reads run later on the MainActor so a notification burst
-            // during Bluetooth renegotiation cannot stall the main thread.
             let reasonValue = notification.userInfo?[
                 AVAudioSessionRouteChangeReasonKey
             ] as? UInt
+            let reason = AudioRouteChangeReason(avReasonValue: reasonValue)
+            let previousRoute = (
+                notification.userInfo?[
+                    AVAudioSessionRouteChangePreviousRouteKey
+                ] as? AVAudioSessionRouteDescription
+            ).map {
+                AudioSessionRouteAttribution.RouteIdentity(
+                    Self.snapshot($0)
+                )
+            }
+            // Callback-time work is content-free and reads no AVAudioSession
+            // state. Freezing the revision here prevents a later async window
+            // from adopting an external notification.
+            let capture = routeAttribution.captureNotification(
+                reason: reason,
+                previousRoute: previousRoute
+            )
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 await self.handleRouteChange(
-                    reason: AudioRouteChangeReason(avReasonValue: reasonValue)
+                    reason: reason,
+                    capture: capture
                 )
             }
         }
         observers.append(observer)
     }
 
-    private func handleRouteChange(reason: AudioRouteChangeReason) async {
+    private func handleRouteChange(
+        reason: AudioRouteChangeReason,
+        capture: AudioSessionRouteAttribution.NotificationCapture
+    ) async {
         let currentRoute = currentRouteOnly
-        let origin = routeAttribution.classify(
-            reason: reason,
+        let origin = routeAttribution.resolve(
+            capture,
             currentRoute: AudioSessionRouteAttribution.RouteIdentity(
                 currentRoute
             )
@@ -153,11 +186,15 @@ public final class AudioSessionController {
     }
 
     private func observeInterruptions() {
+        let routeAttribution = routeAttribution
         let observer = NotificationCenter.default.addObserver(
             forName: AVAudioSession.interruptionNotification,
             object: audioSession,
             queue: .main
         ) { [weak self] notification in
+            // Invalidate captured managed revisions in callback order before
+            // any later route notification can reuse them.
+            routeAttribution.reset()
             let typeValue = notification.userInfo?[
                 AVAudioSessionInterruptionTypeKey
             ] as? UInt
@@ -177,7 +214,6 @@ public final class AudioSessionController {
 
                 switch type {
                 case .began:
-                    self.routeAttribution.reset()
                     await self.eventRouter.deliverInterruptionBegan()
                 case .ended:
                     let options = AVAudioSession.InterruptionOptions(
@@ -187,7 +223,6 @@ public final class AudioSessionController {
                         shouldResume: options.contains(.shouldResume)
                     )
                 @unknown default:
-                    self.routeAttribution.reset()
                     await self.eventRouter.deliverInterruptionBegan()
                 }
             }
@@ -196,15 +231,16 @@ public final class AudioSessionController {
     }
 
     private func observeMediaServicesReset() {
+        let routeAttribution = routeAttribution
         let observer = NotificationCenter.default.addObserver(
             forName: AVAudioSession.mediaServicesWereResetNotification,
             object: audioSession,
             queue: .main
         ) { [weak self] _ in
+            routeAttribution.reset()
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.activeProfile = nil
-                self.routeAttribution.reset()
                 await self.eventRouter.deliverMediaServicesReset()
             }
         }
@@ -219,6 +255,37 @@ public final class AudioSessionController {
             name: port.portName,
             kind: AudioRoutePortKind(portType: port.portType)
         )
+    }
+
+    private nonisolated static func snapshot(
+        _ route: AVAudioSessionRouteDescription
+    ) -> AudioRouteSnapshot {
+        AudioRouteSnapshot(
+            inputs: route.inputs.map(Self.snapshot),
+            outputs: route.outputs.map(Self.snapshot),
+            availableInputs: []
+        )
+    }
+
+    private func performManagedRouteMutation<T>(
+        _ operation: AudioSessionManagedRouteOperation,
+        _ body: () throws -> T
+    ) rethrows -> T {
+        let token = routeAttribution.beginMutation(
+            operation,
+            initialRoute: AudioSessionRouteAttribution.RouteIdentity(
+                currentRouteOnly
+            )
+        )
+        defer {
+            routeAttribution.endMutation(
+                token,
+                settledRoute: AudioSessionRouteAttribution.RouteIdentity(
+                    currentRouteOnly
+                )
+            )
+        }
+        return try body()
     }
 }
 

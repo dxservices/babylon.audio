@@ -1,3 +1,5 @@
+import Foundation
+
 @available(iOS 18, macOS 13, *)
 public enum AudioRouteChangeReason: Equatable, Sendable {
     case unknown
@@ -47,28 +49,25 @@ public struct AudioRouteChangeObservation: Equatable, Sendable {
     }
 }
 
-/// Attributes route-change notifications to this process's own configuration
-/// work using time-boxed ownership instead of route-content matching.
+/// Correlates route notifications with exact, synchronous audio mutations.
 ///
-/// While a managed window is open, every `categoryChange` /
-/// `routeConfigurationChange` is owned by that window, including changes
-/// produced by engine or voice-processing mutations that never touch the
-/// session API. After the outermost window seals, only notifications that
-/// arrive within a short grace interval AND still describe the sealed route
-/// identity are treated as delayed echoes. Everything else is external:
-/// ambiguity fails open toward safety delivery, never toward silence.
+/// A broad async configuration window is only a transaction boundary. It is
+/// never proof that a notification is ours. Each session or engine mutation
+/// records a bounded active revision and exact before/settled route identities.
+/// The notification callback must claim that revision while the synchronous
+/// mutation is still active; after mutation end there is no historical echo
+/// credential. Delivery later verifies the exact settled identity. Missing,
+/// stale, ambiguous, or overflowed evidence fails closed as an external event.
 @available(iOS 18, macOS 13, *)
-struct AudioSessionRouteAttribution {
-    /// Echoes of our own mutations are posted on the main queue almost
-    /// immediately; Bluetooth stacks can settle a managed activation up to
-    /// roughly a second later. Past this bound a spurious external delivery
-    /// costs one idempotent, converging safety rebuild — silent starvation
-    /// from a swallowed real event is the failure mode this bound prevents.
-    static let managedEchoGrace: Duration = .seconds(2)
+final class AudioSessionRouteAttribution: @unchecked Sendable {
+    static let maximumExpectations = 16
+    static let maximumCapturesPerExpectation = 16
+    static let shared = AudioSessionRouteAttribution()
 
     struct RouteIdentity: Equatable, Sendable {
         private struct Port: Equatable, Sendable {
             let id: String
+            let name: String
             let kind: AudioRoutePortKind
         }
 
@@ -76,90 +75,260 @@ struct AudioSessionRouteAttribution {
         private let outputs: [Port]
 
         init(_ route: AudioRouteSnapshot) {
-            inputs = route.inputs.map { Port(id: $0.id, kind: $0.kind) }
-            outputs = route.outputs.map { Port(id: $0.id, kind: $0.kind) }
+            inputs = route.inputs.map {
+                Port(id: $0.id, name: $0.name, kind: $0.kind)
+            }
+            outputs = route.outputs.map {
+                Port(id: $0.id, name: $0.name, kind: $0.kind)
+            }
         }
     }
 
-    private struct Seal {
-        let route: RouteIdentity
+    struct MutationToken: Equatable, Sendable {
+        fileprivate let generation: UInt64
+        fileprivate let revision: UInt64?
+    }
+
+    struct NotificationCapture: Equatable, Sendable {
+        fileprivate let generation: UInt64
+        fileprivate let revision: UInt64?
+        fileprivate let reason: AudioRouteChangeReason
+        fileprivate let operation: AudioSessionManagedRouteOperation?
+    }
+
+    private struct Expectation {
+        let generation: UInt64
+        let revision: UInt64
+        let initialRoute: RouteIdentity
+        var settledRoute: RouteIdentity
         let operation: AudioSessionManagedRouteOperation?
-        let sealedAt: ContinuousClock.Instant
+        var capturedReasons: [AudioRouteChangeReason] = []
     }
 
-    private let now: @Sendable () -> ContinuousClock.Instant
+    private let lock = NSLock()
+    private var generation: UInt64 = 0
+    private var nextRevision: UInt64 = 0
+    private var nextTransaction: UInt64 = 0
     private var windowDepth = 0
-    private var windowOperation: AudioSessionManagedRouteOperation?
-    private var seal: Seal?
+    private var activeTransaction: UInt64?
+    private var failClosedTransaction: UInt64?
+    private var knownRoute: RouteIdentity?
+    private var expectations: [Expectation] = []
+    private var activeMutationRevisions: [UInt64] = []
 
-    init(
-        now: @escaping @Sendable () -> ContinuousClock.Instant = {
-            ContinuousClock().now
+    init() {}
+
+    var isWindowOpen: Bool {
+        withLock { windowDepth > 0 }
+    }
+
+    func updateKnownRoute(_ route: RouteIdentity) {
+        withLock {
+            knownRoute = route
         }
+    }
+
+    func beginWindow(initialRoute: RouteIdentity? = nil) {
+        withLock {
+            if let initialRoute {
+                knownRoute = initialRoute
+            }
+            if windowDepth == 0 {
+                precondition(nextTransaction < UInt64.max)
+                nextTransaction += 1
+                activeTransaction = nextTransaction
+                failClosedTransaction = nil
+            }
+            windowDepth += 1
+        }
+    }
+
+    func endWindow(settledRoute: @autoclosure () -> RouteIdentity) {
+        let route = settledRoute()
+        withLock {
+            guard windowDepth > 0 else { return }
+            knownRoute = route
+            windowDepth -= 1
+            guard windowDepth == 0 else { return }
+            activeTransaction = nil
+            failClosedTransaction = nil
+        }
+    }
+
+    func beginMutation(
+        _ operation: AudioSessionManagedRouteOperation?,
+        initialRoute: RouteIdentity? = nil
+    ) -> MutationToken {
+        withLock {
+            if let initialRoute {
+                knownRoute = initialRoute
+            }
+            guard let route = knownRoute else {
+                return MutationToken(generation: generation, revision: nil)
+            }
+            let transaction: UInt64
+            if let activeTransaction {
+                transaction = activeTransaction
+            } else {
+                precondition(nextTransaction < UInt64.max)
+                nextTransaction += 1
+                transaction = nextTransaction
+            }
+            guard failClosedTransaction != transaction else {
+                return MutationToken(generation: generation, revision: nil)
+            }
+            guard expectations.count < Self.maximumExpectations else {
+                invalidateLocked(failClosedTransaction: transaction)
+                return MutationToken(generation: generation, revision: nil)
+            }
+            precondition(nextRevision < UInt64.max)
+            nextRevision += 1
+            let revision = nextRevision
+            expectations.append(Expectation(
+                generation: generation,
+                revision: revision,
+                initialRoute: route,
+                settledRoute: route,
+                operation: operation
+            ))
+            activeMutationRevisions.append(revision)
+            return MutationToken(generation: generation, revision: revision)
+        }
+    }
+
+    func endMutation(
+        _ token: MutationToken,
+        settledRoute: RouteIdentity? = nil
     ) {
-        self.now = now
-    }
-
-    var isWindowOpen: Bool { windowDepth > 0 }
-
-    /// Opens a managed window. A previous window's seal stays valid for its
-    /// own grace interval so delayed echoes of the previous configuration
-    /// are not orphaned into external deliveries by the next configuration.
-    mutating func beginWindow() {
-        if windowDepth == 0 {
-            windowOperation = nil
+        withLock {
+            if let revision = token.revision {
+                activeMutationRevisions.removeAll { $0 == revision }
+            }
+            if let settledRoute {
+                knownRoute = settledRoute
+            }
+            guard token.generation == generation,
+                  let revision = token.revision,
+                  let index = expectations.firstIndex(where: {
+                      $0.generation == token.generation
+                          && $0.revision == revision
+                  })
+            else { return }
+            let route = settledRoute ?? knownRoute
+            guard let route else { return }
+            expectations[index].settledRoute = route
+            if expectations[index].capturedReasons.isEmpty {
+                expectations.remove(at: index)
+            }
         }
-        windowDepth += 1
     }
 
-    mutating func endWindow(settledRoute: @autoclosure () -> RouteIdentity) {
-        guard windowDepth > 0 else { return }
-        windowDepth -= 1
-        guard windowDepth == 0 else { return }
-        seal = Seal(
-            route: settledRoute(),
-            operation: windowOperation,
-            sealedAt: now()
-        )
-        windowOperation = nil
-    }
-
-    mutating func noteMutation(_ operation: AudioSessionManagedRouteOperation) {
-        windowOperation = operation
-    }
-
-    mutating func classify(
+    /// Called synchronously by the notification observer. This method only
+    /// examines already-cached tracker state and the notification payload.
+    func captureNotification(
         reason: AudioRouteChangeReason,
+        previousRoute: RouteIdentity?
+    ) -> NotificationCapture {
+        withLock {
+            guard reason == .categoryChange
+                    || reason == .routeConfigurationChange
+            else {
+                invalidateLocked(failClosedTransaction: activeTransaction)
+                return NotificationCapture(
+                    generation: generation,
+                    revision: nil,
+                    reason: reason,
+                    operation: nil
+                )
+            }
+            let activeRevision = activeMutationRevisions.last
+            let activeIndex = activeRevision.flatMap { revision in
+                expectations.indices.reversed().first(where: {
+                    expectations[$0].generation == generation
+                        && expectations[$0].revision == revision
+                        && expectations[$0].capturedReasons.count
+                            < Self.maximumCapturesPerExpectation
+                        && (previousRoute == nil
+                            || expectations[$0].initialRoute == previousRoute)
+                })
+            }
+            guard let index = activeIndex else {
+                invalidateLocked(failClosedTransaction: activeTransaction)
+                return NotificationCapture(
+                    generation: generation,
+                    revision: nil,
+                    reason: reason,
+                    operation: nil
+                )
+            }
+            expectations[index].capturedReasons.append(reason)
+            return NotificationCapture(
+                generation: generation,
+                revision: expectations[index].revision,
+                reason: reason,
+                operation: expectations[index].operation
+            )
+        }
+    }
+
+    func resolve(
+        _ capture: NotificationCapture,
         currentRoute: RouteIdentity
     ) -> AudioRouteChangeOrigin {
-        guard reason == .categoryChange
-                || reason == .routeConfigurationChange
-        else {
-            // Device arrivals, departures, and overrides are external
-            // reality; they also invalidate any pending echo attribution.
-            seal = nil
-            return .external
+        withLock {
+            knownRoute = currentRoute
+            guard capture.generation == generation,
+                  let revision = capture.revision,
+                  let index = expectations.firstIndex(where: {
+                      $0.generation == capture.generation
+                          && $0.revision == revision
+                  }),
+                  expectations[index].settledRoute == currentRoute
+            else {
+                invalidateLocked(failClosedTransaction: activeTransaction)
+                return .external
+            }
+            guard let reasonIndex = expectations[index]
+                .capturedReasons.firstIndex(of: capture.reason)
+            else {
+                invalidateLocked(failClosedTransaction: activeTransaction)
+                return .external
+            }
+            expectations[index].capturedReasons.remove(at: reasonIndex)
+            if expectations[index].capturedReasons.isEmpty,
+               !activeMutationRevisions.contains(revision)
+            {
+                expectations.remove(at: index)
+            }
+            return .managedConfiguration(capture.operation)
         }
-        if windowDepth > 0 {
-            return .managedConfiguration(windowOperation)
-        }
-        if let seal,
-           now() - seal.sealedAt <= Self.managedEchoGrace,
-           seal.route == currentRoute
-        {
-            return .managedConfiguration(seal.operation)
-        }
-        seal = nil
-        return .external
     }
 
     /// Interruptions and media-services resets replace any pending
     /// attribution: whatever follows them is a new external reality.
-    mutating func reset() {
-        seal = nil
-        if windowDepth == 0 {
-            windowOperation = nil
+    func reset(currentRoute: RouteIdentity? = nil) {
+        withLock {
+            if let currentRoute {
+                knownRoute = currentRoute
+            }
+            invalidateLocked(failClosedTransaction: activeTransaction)
         }
+    }
+
+    private func invalidateLocked(failClosedTransaction transaction: UInt64?) {
+        precondition(generation < UInt64.max)
+        generation += 1
+        expectations.removeAll(keepingCapacity: true)
+        activeMutationRevisions.removeAll(keepingCapacity: true)
+        if let transaction {
+            failClosedTransaction = transaction
+        }
+    }
+
+    private func withLock<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
     }
 }
 

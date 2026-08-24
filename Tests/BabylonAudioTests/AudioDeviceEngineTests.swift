@@ -5,6 +5,139 @@ import Testing
 @Suite("Audio device engine")
 @MainActor
 struct AudioDeviceEngineTests {
+    @Test("First playback graph mutation captures an active route revision")
+    func firstPlaybackCapturesActiveRouteRevision() async throws {
+        let attribution = AudioSessionRouteAttribution()
+        let route = routeIdentity()
+        attribution.updateKnownRoute(route)
+        let backend = RecordingDeviceEngineBackend()
+        let engine = AudioDeviceEngine(
+            backend: backend,
+            routeAttribution: attribution
+        )
+        let format = try AudioStreamFormat.monoPCM16(sampleRate: 24_000)
+        try engine.configurePlayback(format: format)
+        try engine.start()
+        var capture: AudioSessionRouteAttribution.NotificationCapture?
+        backend.onSchedulePlayback = {
+            capture = attribution.captureNotification(
+                reason: .routeConfigurationChange,
+                previousRoute: route
+            )
+        }
+
+        let frame = try makePlaybackFrame(format: format)
+        let consumption = Task { try await engine.consume(frame) }
+        for _ in 0..<10 { await Task.yield() }
+        backend.completePlayback(sequence: frame.sequence)
+        try await consumption.value
+
+        let captured = try #require(capture)
+        #expect(attribution.resolve(
+            captured,
+            currentRoute: route
+        ) == .managedConfiguration(nil))
+    }
+
+    @Test("Playback completion wait is outside the managed mutation")
+    func playbackCompletionWaitDoesNotOwnRouteRevision() async throws {
+        let attribution = AudioSessionRouteAttribution()
+        let route = routeIdentity()
+        attribution.updateKnownRoute(route)
+        let backend = RecordingDeviceEngineBackend()
+        let engine = AudioDeviceEngine(
+            backend: backend,
+            routeAttribution: attribution
+        )
+        let format = try AudioStreamFormat.monoPCM16(sampleRate: 24_000)
+        try engine.configurePlayback(format: format)
+        try engine.start()
+        var capture: AudioSessionRouteAttribution.NotificationCapture?
+        backend.onWaitForScheduledPlayback = {
+            capture = attribution.captureNotification(
+                reason: .routeConfigurationChange,
+                previousRoute: route
+            )
+        }
+
+        let frame = try makePlaybackFrame(format: format)
+        let consumption = Task { try await engine.consume(frame) }
+        for _ in 0..<10 { await Task.yield() }
+        backend.completePlayback(sequence: frame.sequence)
+        try await consumption.value
+
+        let captured = try #require(capture)
+        #expect(attribution.resolve(
+            captured,
+            currentRoute: route
+        ) == .external)
+    }
+
+    @Test("Unmute graph mutation captures an active route revision")
+    func unmuteCapturesActiveRouteRevision() throws {
+        let attribution = AudioSessionRouteAttribution()
+        let route = routeIdentity()
+        attribution.updateKnownRoute(route)
+        let backend = RecordingDeviceEngineBackend()
+        let engine = AudioDeviceEngine(
+            backend: backend,
+            routeAttribution: attribution
+        )
+        var capture: AudioSessionRouteAttribution.NotificationCapture?
+        backend.onUnmute = {
+            capture = attribution.captureNotification(
+                reason: .routeConfigurationChange,
+                previousRoute: route
+            )
+        }
+
+        try engine.unmuteOutput(after: .safe(output: AudioRoutePort(
+            id: "headset-output",
+            name: "Headset",
+            kind: .bluetoothHFP
+        )))
+
+        let captured = try #require(capture)
+        #expect(attribution.resolve(
+            captured,
+            currentRoute: route
+        ) == .managedConfiguration(nil))
+    }
+
+    @Test("Capture failure tap removal captures an active route revision")
+    func captureFailureCleanupCapturesActiveRouteRevision() async throws {
+        let attribution = AudioSessionRouteAttribution()
+        let route = routeIdentity()
+        attribution.updateKnownRoute(route)
+        let backend = RecordingDeviceEngineBackend()
+        let engine = AudioDeviceEngine(
+            backend: backend,
+            routeAttribution: attribution
+        )
+        try engine.start()
+        try engine.startCapture(
+            configuration: makeCaptureConfiguration(),
+            onFrame: { _ in },
+            onFailure: { _ in }
+        )
+        var capture: AudioSessionRouteAttribution.NotificationCapture?
+        backend.onStopCapture = {
+            capture = attribution.captureNotification(
+                reason: .routeConfigurationChange,
+                previousRoute: route
+            )
+        }
+
+        await backend.failCapture()
+
+        let captured = try #require(capture)
+        #expect(!engine.isCapturing)
+        #expect(attribution.resolve(
+            captured,
+            currentRoute: route
+        ) == .managedConfiguration(nil))
+    }
+
     @Test("Voice processing is disabled by default and requires pre-start opt-in")
     func voiceProcessingRequiresExplicitPreStartOptIn() throws {
         let backend = RecordingDeviceEngineBackend()
@@ -426,6 +559,24 @@ struct AudioDeviceEngineTests {
             duration: .milliseconds(20)
         )
     }
+
+    private func routeIdentity()
+        -> AudioSessionRouteAttribution.RouteIdentity
+    {
+        AudioSessionRouteAttribution.RouteIdentity(AudioRouteSnapshot(
+            inputs: [AudioRoutePort(
+                id: "headset-input",
+                name: "Headset",
+                kind: .bluetoothHFP
+            )],
+            outputs: [AudioRoutePort(
+                id: "headset-output",
+                name: "Headset",
+                kind: .bluetoothHFP
+            )],
+            availableInputs: []
+        ))
+    }
 }
 
 @MainActor
@@ -445,12 +596,16 @@ private final class RecordingDeviceEngineBackend: AudioDeviceEngineBackend {
 
     private(set) var actions: [Action] = []
     private var captureFailureHandlers: [AudioCaptureFailureHandler?] = []
-    private var playbackContinuations:
-        [UInt64: CheckedContinuation<Void, any Error>] = [:]
+    private var playbackCompletions:
+        [UInt64: AudioPlaybackCompletionBridge] = [:]
     private var playbackOwners: [UInt64: AudioDevicePlaybackOwner] = [:]
+    var onSchedulePlayback: (() -> Void)?
+    var onWaitForScheduledPlayback: (() -> Void)?
+    var onUnmute: (() -> Void)?
+    var onStopCapture: (() -> Void)?
 
     var pendingPlaybackSequences: [UInt64] {
-        playbackContinuations.keys.sorted()
+        playbackCompletions.keys.sorted()
     }
 
     func start() throws {
@@ -463,6 +618,9 @@ private final class RecordingDeviceEngineBackend: AudioDeviceEngineBackend {
 
     func setOutputMuted(_ muted: Bool) {
         actions.append(.setOutputMuted(muted))
+        if !muted {
+            onUnmute?()
+        }
     }
 
     func configurePlayback(format: AudioStreamFormat) throws {
@@ -478,17 +636,31 @@ private final class RecordingDeviceEngineBackend: AudioDeviceEngineBackend {
     func schedulePlayback(
         _ frame: AudioFrame,
         owner: AudioDevicePlaybackOwner
-    ) async throws {
+    ) throws -> AudioDeviceScheduledPlayback {
         actions.append(.schedulePlayback(frame.sequence))
-        try await withCheckedThrowingContinuation { continuation in
-            playbackContinuations[frame.sequence] = continuation
-            playbackOwners[frame.sequence] = owner
+        let completion = AudioPlaybackCompletionBridge()
+        playbackCompletions[frame.sequence] = completion
+        playbackOwners[frame.sequence] = owner
+        onSchedulePlayback?()
+        return AudioDeviceScheduledPlayback(
+            sequence: frame.sequence,
+            completion: completion
+        )
+    }
+
+    func waitForScheduledPlayback(
+        _ playback: AudioDeviceScheduledPlayback
+    ) async throws {
+        onWaitForScheduledPlayback?()
+        let consumed = await playback.completion.waitUntilConsumed()
+        guard consumed else {
+            throw AudioDeviceEngineError.playbackStopped
         }
     }
 
     func completePlayback(sequence: UInt64) {
         playbackOwners.removeValue(forKey: sequence)
-        playbackContinuations.removeValue(forKey: sequence)?.resume()
+        playbackCompletions.removeValue(forKey: sequence)?.consumed()
     }
 
     func startCapture(
@@ -511,29 +683,30 @@ private final class RecordingDeviceEngineBackend: AudioDeviceEngineBackend {
 
     func stopCapture() {
         actions.append(.stopCapture)
+        onStopCapture?()
     }
 
     func stopPlayback(owner: AudioDevicePlaybackOwner?) {
         actions.append(.stopPlayback)
-        let sequences = playbackContinuations.keys.filter {
+        let sequences = playbackCompletions.keys.filter {
             owner == nil || playbackOwners[$0] == owner
         }
         let pending = sequences.compactMap { sequence in
             playbackOwners.removeValue(forKey: sequence)
-            return playbackContinuations.removeValue(forKey: sequence)
+            return playbackCompletions.removeValue(forKey: sequence)
         }
-        for continuation in pending {
-            continuation.resume(throwing: AudioDeviceEngineError.playbackStopped)
+        for completion in pending {
+            completion.cancel()
         }
     }
 
     func rebuildAfterMediaServicesReset() {
         actions.append(.rebuildMediaServicesGraph)
-        let pending = Array(playbackContinuations.values)
-        playbackContinuations.removeAll()
+        let pending = Array(playbackCompletions.values)
+        playbackCompletions.removeAll()
         playbackOwners.removeAll()
-        for continuation in pending {
-            continuation.resume(throwing: AudioDeviceEngineError.playbackStopped)
+        for completion in pending {
+            completion.cancel()
         }
     }
 }

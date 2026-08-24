@@ -2179,8 +2179,8 @@ private final class SessionDeviceEngineBackend: AudioDeviceEngineBackend {
     private(set) var stopPlaybackCount = 0
     private var captureHandlers: [AudioCaptureFrameHandler] = []
     private var captureFailureHandlers: [AudioCaptureFailureHandler?] = []
-    private var playbackContinuations:
-        [UInt64: CheckedContinuation<Void, any Error>] = [:]
+    private var playbackCompletions:
+        [UInt64: AudioPlaybackCompletionBridge] = [:]
     private var playbackOwners: [UInt64: AudioDevicePlaybackOwner] = [:]
     private var playbackWaiters:
         [(expected: [UInt64], continuation: CheckedContinuation<Void, Never>)] = []
@@ -2201,14 +2201,28 @@ private final class SessionDeviceEngineBackend: AudioDeviceEngineBackend {
     func schedulePlayback(
         _ frame: AudioFrame,
         owner: AudioDevicePlaybackOwner
-    ) async throws {
+    ) throws -> AudioDeviceScheduledPlayback {
         playbackSequences.append(frame.sequence)
         scheduledPlaybackOwners[frame.sequence] = owner
-        guard suspendsPlayback else { return }
-        try await withCheckedThrowingContinuation { continuation in
-            playbackContinuations[frame.sequence] = continuation
+        let completion = AudioPlaybackCompletionBridge()
+        if suspendsPlayback {
+            playbackCompletions[frame.sequence] = completion
             playbackOwners[frame.sequence] = owner
             resumePlaybackWaitersIfReady()
+        } else {
+            completion.consumed()
+        }
+        return AudioDeviceScheduledPlayback(
+            sequence: frame.sequence,
+            completion: completion
+        )
+    }
+    func waitForScheduledPlayback(
+        _ playback: AudioDeviceScheduledPlayback
+    ) async throws {
+        let consumed = await playback.completion.waitUntilConsumed()
+        guard consumed else {
+            throw AudioDeviceEngineError.playbackStopped
         }
     }
     func setOutputMuted(_ muted: Bool) {}
@@ -2229,17 +2243,15 @@ private final class SessionDeviceEngineBackend: AudioDeviceEngineBackend {
 
     func stopPlayback(owner: AudioDevicePlaybackOwner?) {
         stopPlaybackCount += 1
-        let sequences = playbackContinuations.keys.filter {
+        let sequences = playbackCompletions.keys.filter {
             owner == nil || playbackOwners[$0] == owner
         }
-        let continuations = sequences.compactMap {
+        let completions = sequences.compactMap {
             playbackOwners.removeValue(forKey: $0)
-            return playbackContinuations.removeValue(forKey: $0)
+            return playbackCompletions.removeValue(forKey: $0)
         }
-        for continuation in continuations {
-            continuation.resume(
-                throwing: AudioDeviceEngineError.playbackStopped
-            )
+        for completion in completions {
+            completion.cancel()
         }
     }
     func rebuildAfterMediaServicesReset() {}
@@ -2253,12 +2265,12 @@ private final class SessionDeviceEngineBackend: AudioDeviceEngineBackend {
     }
 
     var pendingPlaybackSequences: [UInt64] {
-        playbackContinuations.keys.sorted()
+        playbackCompletions.keys.sorted()
     }
 
     func completePlayback(sequence: UInt64) {
         playbackOwners.removeValue(forKey: sequence)
-        playbackContinuations.removeValue(forKey: sequence)?.resume()
+        playbackCompletions.removeValue(forKey: sequence)?.consumed()
         resumePlaybackWaitersIfReady()
     }
 
@@ -2302,7 +2314,19 @@ private final class SessionBlockingStartDeviceEngineBackend:
     func schedulePlayback(
         _ frame: AudioFrame,
         owner: AudioDevicePlaybackOwner
-    ) async throws {}
+    ) throws -> AudioDeviceScheduledPlayback {
+        let completion = AudioPlaybackCompletionBridge()
+        completion.consumed()
+        return AudioDeviceScheduledPlayback(
+            sequence: frame.sequence,
+            completion: completion
+        )
+    }
+    func waitForScheduledPlayback(
+        _ playback: AudioDeviceScheduledPlayback
+    ) async throws {
+        _ = await playback.completion.waitUntilConsumed()
+    }
     func setOutputMuted(_ muted: Bool) {}
 
     func startCapture(

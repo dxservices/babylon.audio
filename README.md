@@ -223,21 +223,32 @@ The iOS `AudioSessionController.shared` is the package-owned low-level
 its resulting `routeSnapshot`.
 
 Route notifications caused by this process's own configuration are attributed
-with time-boxed ownership, never route-content matching. While a managed
-configuration window is open (session mutations, and engine or
-voice-processing work performed inside a safety-coordinated configuration),
-every `categoryChange` and `routeConfigurationChange` belongs to that window
-and is reported only through the optional content-free route observation
-handler; it does not recursively enter the safety boundary. After the
-outermost window seals, only notifications that arrive within a short grace
-interval and still describe the sealed route identity count as delayed
-echoes. Everything else is external and fails open into the device event
-handler: device arrivals and departures, overrides, wake, unsuitable-route
-and unknown reasons always deliver immediately and invalidate any pending
-echo attribution, as do interruptions and media-services resets. Ambiguity
-therefore costs at most one idempotent safety rebuild, never a silently
-swallowed external route fact. Observations expose only reason, origin, and
-input/output port kinds, never port identifiers or names.
+to bounded revisions for exact synchronous session or engine mutations. A
+managed async configuration window only groups those revisions; the window by
+itself never owns a notification. The notification callback performs no
+`AVAudioSession` query: it captures the reason, the system-provided previous
+route identity when present, and at most one exact active revision. A missing
+previous route is accepted only when the callback is
+synchronous with that exact mutation. Once the mutation ends, no notification
+can claim its historical revision. Delivery of an already-captured revision
+requires the complete current identity (port identifier, name, and kind) to
+equal that mutation's settled route. Such synchronous echoes are reported only
+through the optional content-free observation handler and do not recursively
+enter the safety boundary.
+Everything else is external and fails closed through the device event handler
+into the safety boundary:
+missing or mismatched identities, expectation or callback overflow, device
+arrivals and departures, overrides, wake, unsuitable-route and
+unknown reasons. Interruptions and media-services resets synchronously
+invalidate captured revisions. Ambiguity therefore costs at most one
+idempotent safety rebuild, never a silently swallowed external route fact.
+Observations expose only reason, origin, and input/output port kinds, never
+port identifiers or names.
+
+Engine attribution covers synchronous graph work, including first-playback
+node attachment and scheduling, unmute-triggered node playback, and capture
+failure tap removal. Waiting for a scheduled buffer's data-consumed completion
+is never inside a managed mutation.
 
 The built-in-microphone profile exposes `.disabled` voice processing and uses
 the default session mode. Only the explicitly allowed private-accessory-duplex

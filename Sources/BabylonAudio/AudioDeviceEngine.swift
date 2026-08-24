@@ -178,6 +178,12 @@ enum AudioDevicePlaybackOwner: Hashable, Sendable {
 }
 
 @available(iOS 18, macOS 13, *)
+struct AudioDeviceScheduledPlayback: Sendable {
+    let sequence: UInt64
+    let completion: AudioPlaybackCompletionBridge
+}
+
+@available(iOS 18, macOS 13, *)
 @MainActor
 protocol AudioDeviceEngineBackend: AnyObject {
     func start() throws
@@ -189,6 +195,9 @@ protocol AudioDeviceEngineBackend: AnyObject {
     func schedulePlayback(
         _ frame: AudioFrame,
         owner: AudioDevicePlaybackOwner
+    ) throws -> AudioDeviceScheduledPlayback
+    func waitForScheduledPlayback(
+        _ playback: AudioDeviceScheduledPlayback
     ) async throws
     func setOutputMuted(_ muted: Bool)
     func startCapture(
@@ -221,16 +230,23 @@ public final class AudioDeviceEngine:
         AudioVoiceProcessingPolicy = .disabled
 
     private let backend: any AudioDeviceEngineBackend
+    private let routeAttribution: AudioSessionRouteAttribution?
     private var activeCaptureToken: AudioDeviceCaptureToken?
     private var activePlaybackTokens: Set<AudioDevicePlaybackToken> = []
 
-    init(backend: any AudioDeviceEngineBackend) {
+    init(
+        backend: any AudioDeviceEngineBackend,
+        routeAttribution: AudioSessionRouteAttribution? = nil
+    ) {
         self.backend = backend
+        self.routeAttribution = routeAttribution
     }
 
     public func start() throws {
         guard !isRunning else { return }
-        try backend.start()
+        try performManagedRouteMutation {
+            try backend.start()
+        }
         isRunning = true
     }
 
@@ -247,7 +263,9 @@ public final class AudioDeviceEngine:
         guard !isRunning else {
             throw AudioDeviceEngineError.engineAlreadyRunning
         }
-        try backend.configurePlayback(format: format)
+        try performManagedRouteMutation {
+            try backend.configurePlayback(format: format)
+        }
         playbackFormat = format
     }
 
@@ -257,7 +275,9 @@ public final class AudioDeviceEngine:
         guard !isRunning else {
             throw AudioDeviceEngineError.engineAlreadyRunning
         }
-        try backend.configureVoiceProcessing(policy)
+        try performManagedRouteMutation {
+            try backend.configureVoiceProcessing(policy)
+        }
         voiceProcessingPolicy = policy
     }
 
@@ -290,13 +310,18 @@ public final class AudioDeviceEngine:
                 throw AudioDeviceEngineError.playbackStopped
             }
         }
-        try await backend.schedulePlayback(frame, owner: owner)
+        let playback = try performManagedRouteMutation {
+            try backend.schedulePlayback(frame, owner: owner)
+        }
+        try await backend.waitForScheduledPlayback(playback)
     }
 
     public func stop() {
         guard isRunning else { return }
         muteOutput()
-        backend.stop()
+        performManagedRouteMutation {
+            backend.stop()
+        }
         activeCaptureToken = nil
         activePlaybackTokens.removeAll(keepingCapacity: true)
         isCapturing = false
@@ -335,11 +360,13 @@ public final class AudioDeviceEngine:
             }
             await onFailure?(error)
         }
-        try backend.startCapture(
-            configuration: configuration,
-            onFrame: onFrame,
-            onFailure: stateAwareFailureHandler
-        )
+        try performManagedRouteMutation {
+            try backend.startCapture(
+                configuration: configuration,
+                onFrame: onFrame,
+                onFailure: stateAwareFailureHandler
+            )
+        }
         activeCaptureToken = token
         isCapturing = true
         return token
@@ -360,7 +387,9 @@ public final class AudioDeviceEngine:
             throw AudioDeviceEngineError.unsafeRoute
         }
         guard isOutputMuted else { return }
-        backend.setOutputMuted(false)
+        performManagedRouteMutation {
+            backend.setOutputMuted(false)
+        }
         isOutputMuted = false
     }
 
@@ -372,7 +401,9 @@ public final class AudioDeviceEngine:
 
     public func stopCapture() {
         activeCaptureToken = nil
-        backend.stopCapture()
+        performManagedRouteMutation {
+            backend.stopCapture()
+        }
         isCapturing = false
     }
 
@@ -383,7 +414,9 @@ public final class AudioDeviceEngine:
 
     public func stopPlayback() {
         activePlaybackTokens.removeAll(keepingCapacity: true)
-        backend.stopPlayback(owner: nil)
+        performManagedRouteMutation {
+            backend.stopPlayback(owner: nil)
+        }
     }
 
     func makePlaybackToken() -> AudioDevicePlaybackToken {
@@ -394,7 +427,9 @@ public final class AudioDeviceEngine:
 
     func stopPlayback(token: AudioDevicePlaybackToken) {
         activePlaybackTokens.remove(token)
-        backend.stopPlayback(owner: .token(token))
+        performManagedRouteMutation {
+            backend.stopPlayback(owner: .token(token))
+        }
     }
 
     /// Replaces the graph invalidated by `mediaServicesWereReset`.
@@ -403,7 +438,9 @@ public final class AudioDeviceEngine:
     /// stopping both data-plane sides, discarding queues, and deactivating the
     /// session. The consumer must configure and start the fresh graph again.
     public func rebuildAfterMediaServicesReset() {
-        backend.rebuildAfterMediaServicesReset()
+        performManagedRouteMutation {
+            backend.rebuildAfterMediaServicesReset()
+        }
         isRunning = false
         isOutputMuted = true
         isCapturing = false
@@ -415,9 +452,19 @@ public final class AudioDeviceEngine:
 
     private func captureDidFail(token: AudioDeviceCaptureToken) -> Bool {
         guard activeCaptureToken == token else { return false }
-        activeCaptureToken = nil
-        isCapturing = false
+        stopCapture()
         return true
+    }
+
+    private func performManagedRouteMutation<T>(
+        _ body: () throws -> T
+    ) rethrows -> T {
+        guard let routeAttribution else {
+            return try body()
+        }
+        let token = routeAttribution.beginMutation(nil)
+        defer { routeAttribution.endMutation(token) }
+        return try body()
     }
 }
 
@@ -427,7 +474,10 @@ import AVFAudio
 @available(iOS 18, *)
 public extension AudioDeviceEngine {
     convenience init() {
-        self.init(backend: AVAudioDeviceEngineBackend())
+        self.init(
+            backend: AVAudioDeviceEngineBackend(),
+            routeAttribution: .shared
+        )
     }
 }
 
@@ -494,7 +544,7 @@ private final class AVAudioDeviceEngineBackend: AudioDeviceEngineBackend {
     func schedulePlayback(
         _ frame: AudioFrame,
         owner: AudioDevicePlaybackOwner
-    ) async throws {
+    ) throws -> AudioDeviceScheduledPlayback {
         guard frame.format == playbackFormat,
               let playbackAVFormat,
               let buffer = try? Self.makePlaybackBuffer(
@@ -528,8 +578,17 @@ private final class AVAudioDeviceEngineBackend: AudioDeviceEngineBackend {
             playerNode.play()
         }
 
-        let consumed = await completion.waitUntilConsumed()
-        playbackCompletions.removeValue(forKey: playbackID)
+        return AudioDeviceScheduledPlayback(
+            sequence: playbackID,
+            completion: completion
+        )
+    }
+
+    func waitForScheduledPlayback(
+        _ playback: AudioDeviceScheduledPlayback
+    ) async throws {
+        let consumed = await playback.completion.waitUntilConsumed()
+        playbackCompletions.removeValue(forKey: playback.sequence)
         if Task.isCancelled {
             throw CancellationError()
         }
@@ -601,12 +660,7 @@ private final class AVAudioDeviceEngineBackend: AudioDeviceEngineBackend {
             } catch is CancellationError {
                 return
             } catch {
-                let ownedFailure = await self?.stopCaptureAfterFailure(
-                    bridge: bridge
-                ) ?? false
-                if ownedFailure {
-                    await onFailure?(error)
-                }
+                await onFailure?(error)
             }
         }
 
@@ -675,14 +729,6 @@ private final class AVAudioDeviceEngineBackend: AudioDeviceEngineBackend {
         playbackFormat = nil
         playbackAVFormat = nil
         outputIsMuted = true
-    }
-
-    private func stopCaptureAfterFailure(
-        bridge: BoundedAudioCaptureBridge
-    ) -> Bool {
-        guard captureBridge === bridge else { return false }
-        stopCapture()
-        return true
     }
 
     private func playbackNode(

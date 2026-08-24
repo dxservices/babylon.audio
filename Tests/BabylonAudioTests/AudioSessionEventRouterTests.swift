@@ -4,223 +4,325 @@ import Testing
 
 @Suite("Audio session route attribution")
 struct AudioSessionRouteAttributionTests {
-    @Test("Category and configuration changes are managed inside a window")
-    func windowOwnsConfigurationReasons() {
-        var attribution = makeAttribution(now: { ContinuousClock().now })
-        let route = identity(id: "a2dp", output: .bluetoothA2DP)
+    @Test("Synchronous causality handles an echo without a previous route")
+    func synchronousEchoWithoutPreviousRouteIsManaged() {
+        let attribution = makeAttribution()
+        let initial = identity(id: "speaker", output: .builtInSpeaker)
+        let settled = identity(id: "a2dp", output: .bluetoothA2DP)
 
-        attribution.beginWindow()
-        attribution.noteMutation(.activate)
-
-        #expect(attribution.classify(
+        attribution.beginWindow(initialRoute: initial)
+        let token = attribution.beginMutation(.activate)
+        let capture = attribution.captureNotification(
             reason: .categoryChange,
-            currentRoute: route
-        ) == .managedConfiguration(.activate))
-        #expect(attribution.classify(
-            reason: .routeConfigurationChange,
-            currentRoute: route
+            previousRoute: nil
+        )
+        attribution.endMutation(token, settledRoute: settled)
+        attribution.endWindow(settledRoute: settled)
+
+        #expect(attribution.resolve(
+            capture,
+            currentRoute: settled
         ) == .managedConfiguration(.activate))
     }
 
-    @Test("A window with no session mutation still owns configuration reasons")
-    func zeroMutationWindowStillOwnsConfigurationReasons() {
-        var attribution = makeAttribution(now: { ContinuousClock().now })
+    @Test("A delayed callback without a previous route fails closed")
+    func delayedEchoWithoutPreviousRouteIsExternal() {
+        let attribution = makeAttribution()
         let route = identity(id: "a2dp", output: .bluetoothA2DP)
+        attribution.updateKnownRoute(route)
+        let token = attribution.beginMutation(.activate)
+        attribution.endMutation(token, settledRoute: route)
 
-        // Engine start / voice-processing configuration inside a managed
-        // window posts routeConfigurationChange without any session call.
-        attribution.beginWindow()
-
-        #expect(attribution.classify(
+        let capture = attribution.captureNotification(
             reason: .routeConfigurationChange,
-            currentRoute: route
-        ) == .managedConfiguration(nil))
-    }
-
-    @Test("Nested windows stay managed until the outermost window ends")
-    func nestedWindowsCountDepth() {
-        var attribution = makeAttribution(now: { ContinuousClock().now })
-        let route = identity(id: "hfp", output: .bluetoothHFP)
-
-        attribution.beginWindow()
-        attribution.beginWindow()
-        attribution.noteMutation(.deactivate)
-        attribution.endWindow(settledRoute: route)
-
-        #expect(attribution.classify(
-            reason: .categoryChange,
-            currentRoute: route
-        ) == .managedConfiguration(.deactivate))
-    }
-
-    @Test("An identity-equal echo within the grace interval is managed")
-    func sealedEchoWithinGraceIsManaged() {
-        let clock = ManualAttributionClock()
-        var attribution = makeAttribution(now: { clock.now })
-        let route = identity(id: "a2dp", output: .bluetoothA2DP)
-
-        attribution.beginWindow()
-        attribution.noteMutation(.activate)
-        attribution.endWindow(settledRoute: route)
-        clock.advance(by: .seconds(1))
-
-        #expect(attribution.classify(
-            reason: .routeConfigurationChange,
-            currentRoute: route
-        ) == .managedConfiguration(.activate))
-        // Multiple echoes within grace stay managed.
-        #expect(attribution.classify(
-            reason: .categoryChange,
-            currentRoute: route
-        ) == .managedConfiguration(.activate))
-    }
-
-    @Test("An identity-equal change after the grace interval is external")
-    func sealedEchoAfterGraceIsExternal() {
-        let clock = ManualAttributionClock()
-        var attribution = makeAttribution(now: { clock.now })
-        let route = identity(id: "a2dp", output: .bluetoothA2DP)
-
-        attribution.beginWindow()
-        attribution.endWindow(settledRoute: route)
-        clock.advance(
-            by: AudioSessionRouteAttribution.managedEchoGrace + .seconds(1)
+            previousRoute: nil
         )
 
-        #expect(attribution.classify(
-            reason: .routeConfigurationChange,
+        #expect(attribution.resolve(
+            capture,
             currentRoute: route
         ) == .external)
     }
 
-    @Test("A different route identity during grace is external")
-    func differentIdentityDuringGraceIsExternal() {
-        var attribution = makeAttribution(now: { ContinuousClock().now })
-        let sealed = identity(id: "a2dp", output: .bluetoothA2DP)
-        let moved = identity(id: "speaker", output: .builtInSpeaker)
+    @Test("An exact same-route callback captured after mutation end is external")
+    func callbackAfterMutationEndIsExternal() {
+        let attribution = makeAttribution()
+        let initial = identity(id: "speaker", output: .builtInSpeaker)
+        let settled = identity(id: "hfp", output: .bluetoothHFP)
 
-        attribution.beginWindow()
-        attribution.endWindow(settledRoute: sealed)
+        attribution.updateKnownRoute(initial)
+        let token = attribution.beginMutation(.selectPrivateAccessoryInput)
+        attribution.endMutation(token, settledRoute: settled)
+        let capture = attribution.captureNotification(
+            reason: .routeConfigurationChange,
+            previousRoute: initial
+        )
 
-        #expect(attribution.classify(
-            reason: .routeConfigurationChange,
-            currentRoute: moved
-        ) == .external)
-        // The external classification invalidates the seal: a later
-        // identity-equal change is no longer treated as an echo.
-        #expect(attribution.classify(
-            reason: .routeConfigurationChange,
-            currentRoute: sealed
+        #expect(attribution.resolve(
+            capture,
+            currentRoute: settled
         ) == .external)
     }
 
-    @Test("Device arrivals and departures are always external")
-    func deviceReasonsAreAlwaysExternal() {
-        var attribution = makeAttribution(now: { ContinuousClock().now })
+    @Test("Multiple synchronous callbacks can claim one active revision")
+    func multipleCallbacksCanClaimActiveRevision() {
+        let attribution = makeAttribution()
         let route = identity(id: "a2dp", output: .bluetoothA2DP)
-        attribution.beginWindow()
-        attribution.noteMutation(.activate)
-
-        for reason in [AudioRouteChangeReason.newDeviceAvailable,
-                       .oldDeviceUnavailable,
-                       .override,
-                       .wakeFromSleep,
-                       .noSuitableRouteForCategory,
-                       .unknown]
-        {
-            #expect(attribution.classify(
+        attribution.updateKnownRoute(route)
+        let token = attribution.beginMutation(.activate)
+        let captures = [AudioRouteChangeReason.routeConfigurationChange,
+                        .routeConfigurationChange].map { reason in
+            attribution.captureNotification(
                 reason: reason,
+                previousRoute: route
+            )
+        }
+        attribution.endMutation(token, settledRoute: route)
+
+        for capture in captures {
+            #expect(attribution.resolve(
+                capture,
+                currentRoute: route
+            ) == .managedConfiguration(.activate))
+        }
+        let replay = attribution.captureNotification(
+            reason: .routeConfigurationChange,
+            previousRoute: route
+        )
+        #expect(attribution.resolve(
+            replay,
+            currentRoute: route
+        ) == .external)
+    }
+
+    @Test("An async window without an exact mutation cannot own an event")
+    func openWindowDoesNotOwnExternalEvent() {
+        let attribution = makeAttribution()
+        let initial = identity(id: "a2dp", output: .bluetoothA2DP)
+        let external = identity(id: "speaker", output: .builtInSpeaker)
+        attribution.beginWindow(initialRoute: initial)
+
+        let capture = attribution.captureNotification(
+            reason: .routeConfigurationChange,
+            previousRoute: initial
+        )
+
+        #expect(attribution.resolve(
+            capture,
+            currentRoute: external
+        ) == .external)
+        #expect(attribution.isWindowOpen)
+    }
+
+    @Test("A notification with an unrelated previous route is external")
+    func unrelatedPreviousRouteIsExternal() {
+        let attribution = makeAttribution()
+        let initial = identity(id: "a2dp", output: .bluetoothA2DP)
+        let unrelated = identity(id: "wired", output: .wiredHeadphones)
+        attribution.updateKnownRoute(initial)
+        let token = attribution.beginMutation(.activate)
+        let capture = attribution.captureNotification(
+            reason: .routeConfigurationChange,
+            previousRoute: unrelated
+        )
+        attribution.endMutation(token, settledRoute: initial)
+        #expect(attribution.resolve(
+            capture,
+            currentRoute: initial
+        ) == .external)
+    }
+
+    @Test("A current route mismatch invalidates a captured revision")
+    func currentRouteMismatchIsExternal() {
+        let attribution = makeAttribution()
+        let initial = identity(id: "speaker", output: .builtInSpeaker)
+        let settled = identity(id: "a2dp", output: .bluetoothA2DP)
+        let external = identity(id: "hfp", output: .bluetoothHFP)
+        attribution.updateKnownRoute(initial)
+        let token = attribution.beginMutation(.activate)
+        let capture = attribution.captureNotification(
+            reason: .routeConfigurationChange,
+            previousRoute: initial
+        )
+        attribution.endMutation(token, settledRoute: settled)
+
+        #expect(attribution.resolve(
+            capture,
+            currentRoute: external
+        ) == .external)
+    }
+
+    @Test("Name participates in exact route identity")
+    func routeNameParticipatesInIdentity() {
+        let attribution = makeAttribution()
+        let initial = identity(
+            id: "headset",
+            name: "Headset A",
+            output: .bluetoothHFP
+        )
+        let renamed = identity(
+            id: "headset",
+            name: "Headset B",
+            output: .bluetoothHFP
+        )
+        attribution.updateKnownRoute(initial)
+        let token = attribution.beginMutation(.activate)
+        let capture = attribution.captureNotification(
+            reason: .routeConfigurationChange,
+            previousRoute: initial
+        )
+        attribution.endMutation(token, settledRoute: initial)
+
+        #expect(attribution.resolve(
+            capture,
+            currentRoute: renamed
+        ) == .external)
+    }
+
+    @Test("A callback-time revision survives a later managed transaction")
+    func callbackCaptureIsFrozenAcrossNewTransaction() {
+        let attribution = makeAttribution()
+        let route = identity(id: "a2dp", output: .bluetoothA2DP)
+        attribution.updateKnownRoute(route)
+        let first = attribution.beginMutation(.activate)
+        let capture = attribution.captureNotification(
+            reason: .categoryChange,
+            previousRoute: route
+        )
+        attribution.endMutation(first, settledRoute: route)
+
+        let second = attribution.beginMutation(.deactivate)
+        attribution.endMutation(second, settledRoute: route)
+
+        #expect(attribution.resolve(
+            capture,
+            currentRoute: route
+        ) == .managedConfiguration(.activate))
+    }
+
+    @Test("Interruption or reset invalidates callback-time captures")
+    func resetInvalidatesCapturedRevision() {
+        let attribution = makeAttribution()
+        let route = identity(id: "hfp", output: .bluetoothHFP)
+        attribution.updateKnownRoute(route)
+        let token = attribution.beginMutation(.deactivate)
+        let capture = attribution.captureNotification(
+            reason: .categoryChange,
+            previousRoute: route
+        )
+        attribution.endMutation(token, settledRoute: route)
+
+        attribution.reset()
+
+        #expect(attribution.resolve(
+            capture,
+            currentRoute: route
+        ) == .external)
+    }
+
+    @Test("External reasons invalidate captured managed expectations")
+    func externalReasonInvalidatesExpectations() {
+        let attribution = makeAttribution()
+        let route = identity(id: "a2dp", output: .bluetoothA2DP)
+        attribution.updateKnownRoute(route)
+        let token = attribution.beginMutation(.activate)
+        let echo = attribution.captureNotification(
+            reason: .routeConfigurationChange,
+            previousRoute: route
+        )
+
+        let external = attribution.captureNotification(
+            reason: .oldDeviceUnavailable,
+            previousRoute: route
+        )
+        attribution.endMutation(token, settledRoute: route)
+        #expect(attribution.resolve(
+            external,
+            currentRoute: route
+        ) == .external)
+        #expect(attribution.resolve(
+            echo,
+            currentRoute: route
+        ) == .external)
+    }
+
+    @Test("Expectation overflow fails closed and a later transaction recovers")
+    func boundedExpectationLifecycle() {
+        let attribution = makeAttribution()
+        let route = identity(id: "a2dp", output: .bluetoothA2DP)
+        attribution.updateKnownRoute(route)
+
+        attribution.beginWindow(initialRoute: route)
+        var tokens: [AudioSessionRouteAttribution.MutationToken] = []
+        for _ in 0...AudioSessionRouteAttribution.maximumExpectations {
+            tokens.append(attribution.beginMutation(.activate))
+        }
+        let overflow = attribution.captureNotification(
+            reason: .routeConfigurationChange,
+            previousRoute: route
+        )
+        #expect(attribution.resolve(
+            overflow,
+            currentRoute: route
+        ) == .external)
+        for token in tokens.reversed() {
+            attribution.endMutation(token, settledRoute: route)
+        }
+        attribution.endWindow(settledRoute: route)
+
+        attribution.beginWindow(initialRoute: route)
+        let recovered = attribution.beginMutation(.activate)
+        let echo = attribution.captureNotification(
+            reason: .routeConfigurationChange,
+            previousRoute: route
+        )
+        attribution.endMutation(recovered, settledRoute: route)
+        attribution.endWindow(settledRoute: route)
+        #expect(attribution.resolve(
+            echo,
+            currentRoute: route
+        ) == .managedConfiguration(.activate))
+    }
+
+    @Test("Callback overflow invalidates the active revision")
+    func boundedCallbackLifecycle() {
+        let attribution = makeAttribution()
+        let route = identity(id: "a2dp", output: .bluetoothA2DP)
+        attribution.updateKnownRoute(route)
+        let token = attribution.beginMutation(.activate)
+        let maximumCaptures = AudioSessionRouteAttribution
+            .maximumCapturesPerExpectation
+        let captures = (0..<maximumCaptures).map { _ in
+            attribution.captureNotification(
+                reason: .routeConfigurationChange,
+                previousRoute: route
+            )
+        }
+        let overflow = attribution.captureNotification(
+            reason: .routeConfigurationChange,
+            previousRoute: route
+        )
+        attribution.endMutation(token, settledRoute: route)
+
+        #expect(attribution.resolve(
+            overflow,
+            currentRoute: route
+        ) == .external)
+        for capture in captures {
+            #expect(attribution.resolve(
+                capture,
                 currentRoute: route
             ) == .external)
         }
     }
 
-    @Test("An external device fact invalidates a pending seal")
-    func externalDeviceFactInvalidatesSeal() {
-        var attribution = makeAttribution(now: { ContinuousClock().now })
-        let route = identity(id: "a2dp", output: .bluetoothA2DP)
-
-        attribution.beginWindow()
-        attribution.endWindow(settledRoute: route)
-        #expect(attribution.classify(
-            reason: .oldDeviceUnavailable,
-            currentRoute: route
-        ) == .external)
-
-        // The echo that follows real device removal must not be swallowed
-        // by the stale seal even when the route identity matches again.
-        #expect(attribution.classify(
-            reason: .routeConfigurationChange,
-            currentRoute: route
-        ) == .external)
-    }
-
-    @Test("A new window keeps the previous seal for its own delayed echoes")
-    func newWindowKeepsPreviousSeal() {
-        let clock = ManualAttributionClock()
-        var attribution = makeAttribution(now: { clock.now })
-        let first = identity(id: "a2dp", output: .bluetoothA2DP)
-
-        attribution.beginWindow()
-        attribution.noteMutation(.activate)
-        attribution.endWindow(settledRoute: first)
-        clock.advance(by: .milliseconds(100))
-
-        // The next configuration begins; a delayed echo of the first
-        // configuration arrives while its window is open.
-        attribution.beginWindow()
-        #expect(attribution.classify(
-            reason: .routeConfigurationChange,
-            currentRoute: first
-        ) == .managedConfiguration(nil))
-        attribution.endWindow(settledRoute: first)
-
-        // After the second window seals, first-window echoes still match by
-        // identity through the second seal.
-        #expect(attribution.classify(
-            reason: .categoryChange,
-            currentRoute: first
-        ) == .managedConfiguration(nil))
-    }
-
-    @Test("Reset clears the seal so later echoes are external")
-    func resetClearsSeal() {
-        var attribution = makeAttribution(now: { ContinuousClock().now })
-        let route = identity(id: "a2dp", output: .bluetoothA2DP)
-
-        attribution.beginWindow()
-        attribution.endWindow(settledRoute: route)
-        attribution.reset()
-
-        #expect(attribution.classify(
-            reason: .routeConfigurationChange,
-            currentRoute: route
-        ) == .external)
-    }
-
-    @Test("Reset during an open window keeps the window's ownership")
-    func resetKeepsOpenWindowDepth() {
-        var attribution = makeAttribution(now: { ContinuousClock().now })
-        let route = identity(id: "a2dp", output: .bluetoothA2DP)
-
-        attribution.beginWindow()
-        attribution.reset()
-
-        #expect(attribution.isWindowOpen)
-        #expect(attribution.classify(
-            reason: .categoryChange,
-            currentRoute: route
-        ) == .managedConfiguration(nil))
-    }
-
-    private func makeAttribution(
-        now: @escaping @Sendable () -> ContinuousClock.Instant
-    ) -> AudioSessionRouteAttribution {
-        AudioSessionRouteAttribution(now: now)
+    private func makeAttribution() -> AudioSessionRouteAttribution {
+        AudioSessionRouteAttribution()
     }
 
     private func identity(
         id: String,
+        name: String? = nil,
         output: AudioRoutePortKind
     ) -> AudioSessionRouteAttribution.RouteIdentity {
         AudioSessionRouteAttribution.RouteIdentity(AudioRouteSnapshot(
@@ -231,7 +333,7 @@ struct AudioSessionRouteAttributionTests {
             )],
             outputs: [AudioRoutePort(
                 id: "output-\(id)",
-                name: "Output \(id)",
+                name: name ?? "Output \(id)",
                 kind: output
             )],
             availableInputs: []
@@ -335,23 +437,6 @@ struct AudioSessionEventRouterTests {
             )],
             availableInputs: []
         )
-    }
-}
-
-private final class ManualAttributionClock: @unchecked Sendable {
-    private let lock = NSLock()
-    private var instant = ContinuousClock().now
-
-    var now: ContinuousClock.Instant {
-        lock.lock()
-        defer { lock.unlock() }
-        return instant
-    }
-
-    func advance(by duration: Duration) {
-        lock.lock()
-        defer { lock.unlock() }
-        instant = instant.advanced(by: duration)
     }
 }
 

@@ -77,10 +77,13 @@ All notable changes to this project will be documented in this file.
   stops capture and playback, invalidates both streaming generations,
   deactivates the session, and only then delivers route, interruption, or
   media-reset events.
-- Attribute package-owned route notifications with time-boxed managed
-  configuration windows plus a bounded post-seal echo grace, delivering all
-  other route facts, interruptions, and resets fail-open to the safety
-  handler and reporting managed echoes only as content-free observations.
+- Attribute package-owned route notifications only when their callback claims
+  an exact active mutation revision, with callback-time previous-route capture
+  and exact settled-route matching; mutation-end, ambiguous, overflowed,
+  interrupted, or reset attribution fails closed into the safety handler.
+- Attribute first-playback node attachment and scheduling, unmute-triggered
+  node playback, and capture-failure tap removal as synchronous engine
+  mutations while keeping playback-completion waits outside attribution.
 - Mark the capture-tap and playback-completion closures nonisolated
   Sendable so real-device audio-thread callbacks no longer trip the
   MainActor dispatch-queue assertion inferred from the enclosing type.
