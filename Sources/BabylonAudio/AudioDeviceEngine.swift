@@ -192,6 +192,7 @@ protocol AudioDeviceEngineBackend: AnyObject {
     func configureVoiceProcessing(
         _ policy: AudioVoiceProcessingPolicy
     ) throws
+    func playbackNodeExists(owner: AudioDevicePlaybackOwner) -> Bool
     func schedulePlayback(
         _ frame: AudioFrame,
         owner: AudioDevicePlaybackOwner
@@ -214,6 +215,10 @@ protocol AudioDeviceEngineBackend: AnyObject {
 @available(iOS 18, macOS 13, *)
 extension AudioDeviceEngineBackend {
     var outputHardwareIsReady: Bool { true }
+
+    // Fake backends carry no node graph; treating every owner as attached
+    // keeps their scheduling free of attribution bookkeeping by default.
+    func playbackNodeExists(owner: AudioDevicePlaybackOwner) -> Bool { true }
 }
 
 @available(iOS 18, macOS 13, *)
@@ -310,8 +315,18 @@ public final class AudioDeviceEngine:
                 throw AudioDeviceEngineError.playbackStopped
             }
         }
-        let playback = try performManagedRouteMutation {
-            try backend.schedulePlayback(frame, owner: owner)
+        // Only the first schedule for an owner attaches a node to the graph,
+        // which is the sole route-affecting part of playback. Per-frame
+        // scheduling must not mint attribution credentials: at speech frame
+        // rates it would overflow the bounded expectation table within the
+        // echo grace and wipe pending route credentials wholesale.
+        let playback: AudioDeviceScheduledPlayback
+        if backend.playbackNodeExists(owner: owner) {
+            playback = try backend.schedulePlayback(frame, owner: owner)
+        } else {
+            playback = try performManagedRouteMutation {
+                try backend.schedulePlayback(frame, owner: owner)
+            }
         }
         try await backend.waitForScheduledPlayback(playback)
     }
@@ -387,9 +402,9 @@ public final class AudioDeviceEngine:
             throw AudioDeviceEngineError.unsafeRoute
         }
         guard isOutputMuted else { return }
-        performManagedRouteMutation {
-            backend.setOutputMuted(false)
-        }
+        // Volume and node playback are route-neutral; an unmute must not
+        // consume attribution capacity.
+        backend.setOutputMuted(false)
         isOutputMuted = false
     }
 
@@ -539,6 +554,10 @@ private final class AVAudioDeviceEngineBackend: AudioDeviceEngineBackend {
             throw AudioDeviceEngineError.engineAlreadyRunning
         }
         try engine.inputNode.setVoiceProcessingEnabled(policy != .disabled)
+    }
+
+    func playbackNodeExists(owner: AudioDevicePlaybackOwner) -> Bool {
+        playbackNodes[owner] != nil
     }
 
     func schedulePlayback(

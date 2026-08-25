@@ -104,6 +104,7 @@ final class AudioSessionRouteAttribution: @unchecked Sendable {
         fileprivate let revision: UInt64?
         fileprivate let reason: AudioRouteChangeReason
         fileprivate let operation: AudioSessionManagedRouteOperation?
+        fileprivate var claimedDelayed = false
     }
 
     private struct Expectation {
@@ -306,7 +307,8 @@ final class AudioSessionRouteAttribution: @unchecked Sendable {
                 generation: generation,
                 revision: expectations[index].revision,
                 reason: reason,
-                operation: expectations[index].operation
+                operation: expectations[index].operation,
+                claimedDelayed: activeIndex == nil
             )
         }
     }
@@ -332,12 +334,21 @@ final class AudioSessionRouteAttribution: @unchecked Sendable {
                 return .external
             }
             expectations[index].capturedReasons.remove(at: reasonIndex)
-            // The world moved between capture and delivery: this event
-            // delivers as external, but the other expectations keep their
-            // credentials for their own echoes.
-            guard expectations[index].settledRoute == currentRoute else {
+            if expectations[index].settledRoute == currentRoute {
+                return .managedConfiguration(capture.operation)
+            }
+            // A delayed echo frequently IS the late Bluetooth settle of its
+            // own mutation: the recorded settled identity was read
+            // synchronously before the OS finished moving the route. The
+            // claim already verified the notification's payload chain, so
+            // adopt the delivered route as this mutation's settled identity.
+            guard capture.claimedDelayed else {
+                // The world moved between an in-mutation capture and its
+                // delivery: this event delivers as external, but the other
+                // expectations keep their credentials for their own echoes.
                 return .external
             }
+            expectations[index].settledRoute = currentRoute
             return .managedConfiguration(capture.operation)
         }
     }

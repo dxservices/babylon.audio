@@ -77,6 +77,13 @@ All notable changes to this project will be documented in this file.
   stops capture and playback, invalidates both streaming generations,
   deactivates the session, and only then delivers route, interruption, or
   media-reset events.
+- Stop minting attribution credentials for route-neutral engine work:
+  per-frame playback scheduling on an attached node and output unmute no
+  longer consume bounded expectation capacity, so sustained playback
+  cannot overflow the table and wipe pending route credentials.
+- Let a delayed echo adopt a late-settling managed route move as its
+  mutation's settled identity, and let one configure call raise the
+  stable-unsafe settle bail for post-arrival discovery.
 - Keep retired mutation revisions claimable for a bounded delayed-echo
   grace matched by the notification's own previous-route payload, and stop
   revoking sibling revisions on unmatched configuration notifications, so

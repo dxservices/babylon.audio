@@ -80,8 +80,56 @@ struct AudioDeviceEngineTests {
         ) == .external)
     }
 
-    @Test("Unmute graph mutation captures an active route revision")
-    func unmuteCapturesActiveRouteRevision() throws {
+    @Test("Scheduling on an attached node mints no attribution credential")
+    func attachedNodeSchedulingMintsNoRouteRevision() async throws {
+        let clock = ManualEngineAttributionClock()
+        let attribution = AudioSessionRouteAttribution(now: { clock.now })
+        let route = routeIdentity()
+        attribution.updateKnownRoute(route)
+        let backend = RecordingDeviceEngineBackend()
+        let engine = AudioDeviceEngine(
+            backend: backend,
+            routeAttribution: attribution
+        )
+        let format = try AudioStreamFormat.monoPCM16(sampleRate: 24_000)
+        try engine.configurePlayback(format: format)
+        try engine.start()
+        let first = try makePlaybackFrame(format: format)
+        let attach = Task { try await engine.consume(first) }
+        for _ in 0..<10 { await Task.yield() }
+        backend.completePlayback(sequence: first.sequence)
+        try await attach.value
+        // Outlive the attach mutation's echo grace so any credential a
+        // per-frame schedule minted would be the only claimable one left.
+        clock.advance(
+            by: AudioSessionRouteAttribution.delayedEchoGrace + .seconds(1)
+        )
+        var capture: AudioSessionRouteAttribution.NotificationCapture?
+        backend.onSchedulePlayback = {
+            capture = attribution.captureNotification(
+                reason: .routeConfigurationChange,
+                previousRoute: route
+            )
+        }
+
+        let frame = try makePlaybackFrame(format: format, sequence: 1)
+        let consumption = Task { try await engine.consume(frame) }
+        for _ in 0..<10 { await Task.yield() }
+        backend.completePlayback(sequence: frame.sequence)
+        try await consumption.value
+
+        // Per-frame scheduling is route-neutral once the node is attached;
+        // an unclaimed capture during it must deliver externally instead of
+        // consuming bounded attribution capacity.
+        let captured = try #require(capture)
+        #expect(attribution.resolve(
+            captured,
+            currentRoute: route
+        ) == .external)
+    }
+
+    @Test("Unmute is route-neutral and mints no attribution credential")
+    func unmuteMintsNoRouteRevision() throws {
         let attribution = AudioSessionRouteAttribution()
         let route = routeIdentity()
         attribution.updateKnownRoute(route)
@@ -104,11 +152,13 @@ struct AudioDeviceEngineTests {
             kind: .bluetoothHFP
         )))
 
+        // Volume changes cannot move the route; a notification arriving
+        // during unmute must not be swallowed as a managed echo.
         let captured = try #require(capture)
         #expect(attribution.resolve(
             captured,
             currentRoute: route
-        ) == .managedConfiguration(nil))
+        ) == .external)
     }
 
     @Test("Capture failure tap removal captures an active route revision")
@@ -588,6 +638,7 @@ struct AudioDeviceEngineTests {
 
 @MainActor
 private final class RecordingDeviceEngineBackend: AudioDeviceEngineBackend {
+    private var attachedPlaybackOwners: Set<AudioDevicePlaybackOwner> = []
     enum Action: Equatable {
         case start
         case stop
@@ -640,10 +691,15 @@ private final class RecordingDeviceEngineBackend: AudioDeviceEngineBackend {
         actions.append(.configureVoiceProcessing(policy))
     }
 
+    func playbackNodeExists(owner: AudioDevicePlaybackOwner) -> Bool {
+        attachedPlaybackOwners.contains(owner)
+    }
+
     func schedulePlayback(
         _ frame: AudioFrame,
         owner: AudioDevicePlaybackOwner
     ) throws -> AudioDeviceScheduledPlayback {
+        attachedPlaybackOwners.insert(owner)
         actions.append(.schedulePlayback(frame.sequence))
         let completion = AudioPlaybackCompletionBridge()
         playbackCompletions[frame.sequence] = completion

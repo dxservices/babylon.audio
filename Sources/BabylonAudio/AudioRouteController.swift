@@ -57,11 +57,20 @@ public final class AudioRouteController {
         self.waitForRouteUpdate = waitForRouteUpdate
     }
 
+    /// `minimumSettleConfirmations` raises the stable-unsafe early-exit
+    /// threshold for this single call. A route discovery that runs right
+    /// after a device arrival must outlast the roughly one-second Bluetooth
+    /// attach that the default bail (five 100 ms confirmations) undercuts.
     public func configure(
         inputPolicy: AudioInputPolicy,
         outputPolicy: DeviceOutputPolicy,
-        trustedOutputs: Set<AudioTrustedOutput>
+        trustedOutputs: Set<AudioTrustedOutput>,
+        minimumSettleConfirmations: Int? = nil
     ) async throws -> AudioRouteConfigurationResult {
+        let unsafeConfirmationBound = max(
+            stableUnsafeConfirmations,
+            minimumSettleConfirmations ?? 0
+        )
         session.beginManagedRouteConfiguration()
         defer { session.endManagedRouteConfiguration() }
         let profiles = AudioSessionProfilePolicy.activationOrder(for: inputPolicy)
@@ -121,7 +130,7 @@ public final class AudioRouteController {
                             unchangedUnsafeConfirmations += 1
                             if !selectedPrivateAccessoryInput,
                                unchangedUnsafeConfirmations
-                                >= stableUnsafeConfirmations
+                                >= unsafeConfirmationBound
                             {
                                 break observation
                             }

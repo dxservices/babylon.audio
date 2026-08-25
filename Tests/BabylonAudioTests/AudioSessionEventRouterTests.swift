@@ -74,6 +74,38 @@ struct AudioSessionRouteAttributionTests {
         ) == .managedConfiguration(.selectPrivateAccessoryInput))
     }
 
+    @Test("A delayed echo adopts a late-settling managed route move")
+    func delayedEchoAdoptsLateSettledRoute() {
+        let attribution = makeAttribution()
+        let initial = identity(id: "speaker", output: .builtInSpeaker)
+        let synchronousSettle = identity(id: "receiver", output: .receiver)
+        let lateSettle = identity(id: "a2dp", output: .bluetoothA2DP)
+
+        // The mutation returned before the OS finished moving the route, so
+        // the recorded settled identity is the pre-move route.
+        attribution.updateKnownRoute(initial)
+        let token = attribution.beginMutation(.activate)
+        attribution.endMutation(token, settledRoute: synchronousSettle)
+        let echo = attribution.captureNotification(
+            reason: .routeConfigurationChange,
+            previousRoute: synchronousSettle
+        )
+
+        #expect(attribution.resolve(
+            echo,
+            currentRoute: lateSettle
+        ) == .managedConfiguration(.activate))
+        // The adopted settled identity keeps later echoes coherent.
+        let follower = attribution.captureNotification(
+            reason: .categoryChange,
+            previousRoute: lateSettle
+        )
+        #expect(attribution.resolve(
+            follower,
+            currentRoute: lateSettle
+        ) == .managedConfiguration(.activate))
+    }
+
     @Test("A delayed echo after the grace interval is external")
     func delayedEchoAfterGraceIsExternal() {
         let clock = ManualAttributionClock()
