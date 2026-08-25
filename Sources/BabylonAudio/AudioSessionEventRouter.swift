@@ -54,14 +54,24 @@ public struct AudioRouteChangeObservation: Equatable, Sendable {
 /// A broad async configuration window is only a transaction boundary. It is
 /// never proof that a notification is ours. Each session or engine mutation
 /// records a bounded active revision and exact before/settled route identities.
-/// The notification callback must claim that revision while the synchronous
-/// mutation is still active; after mutation end there is no historical echo
-/// credential. Delivery later verifies the exact settled identity. Missing,
-/// stale, ambiguous, or overflowed evidence fails closed as an external event.
+/// The notification callback claims a revision either while the synchronous
+/// mutation is still active, or — because AVFoundation delivers route
+/// notifications asynchronously on the main queue, always after the mutation
+/// returned — within a bounded delayed-echo grace after mutation end, and
+/// then only when the notification's own previous-route payload matches that
+/// mutation's exact before/settled identity chain. Delivery later verifies
+/// the exact settled identity. Missing, stale, expired, ambiguous, or
+/// overflowed evidence delivers as an external event: ambiguity costs one
+/// idempotent safety rebuild, never a silently swallowed external fact.
 @available(iOS 18, macOS 13, *)
 final class AudioSessionRouteAttribution: @unchecked Sendable {
     static let maximumExpectations = 16
     static let maximumCapturesPerExpectation = 16
+    /// Echoes of our own mutations reach the main queue almost immediately;
+    /// Bluetooth stacks can settle a managed activation up to roughly a
+    /// second later. Past this bound an expectation loses its credential and
+    /// matching notifications deliver as external.
+    static let delayedEchoGrace: Duration = .seconds(2)
     static let shared = AudioSessionRouteAttribution()
 
     struct RouteIdentity: Equatable, Sendable {
@@ -103,9 +113,11 @@ final class AudioSessionRouteAttribution: @unchecked Sendable {
         var settledRoute: RouteIdentity
         let operation: AudioSessionManagedRouteOperation?
         var capturedReasons: [AudioRouteChangeReason] = []
+        var retiredAt: ContinuousClock.Instant?
     }
 
     private let lock = NSLock()
+    private let now: @Sendable () -> ContinuousClock.Instant
     private var generation: UInt64 = 0
     private var nextRevision: UInt64 = 0
     private var nextTransaction: UInt64 = 0
@@ -116,7 +128,13 @@ final class AudioSessionRouteAttribution: @unchecked Sendable {
     private var expectations: [Expectation] = []
     private var activeMutationRevisions: [UInt64] = []
 
-    init() {}
+    init(
+        now: @escaping @Sendable () -> ContinuousClock.Instant = {
+            ContinuousClock().now
+        }
+    ) {
+        self.now = now
+    }
 
     var isWindowOpen: Bool {
         withLock { windowDepth > 0 }
@@ -177,6 +195,7 @@ final class AudioSessionRouteAttribution: @unchecked Sendable {
             guard failClosedTransaction != transaction else {
                 return MutationToken(generation: generation, revision: nil)
             }
+            pruneExpiredLocked()
             guard expectations.count < Self.maximumExpectations else {
                 invalidateLocked(failClosedTransaction: transaction)
                 return MutationToken(generation: generation, revision: nil)
@@ -217,9 +236,11 @@ final class AudioSessionRouteAttribution: @unchecked Sendable {
             let route = settledRoute ?? knownRoute
             guard let route else { return }
             expectations[index].settledRoute = route
-            if expectations[index].capturedReasons.isEmpty {
-                expectations.remove(at: index)
-            }
+            // The expectation retires instead of vanishing: AVFoundation
+            // delivers this mutation's echoes on the main queue after the
+            // mutation has already returned, so the credential must survive
+            // for the bounded delayed-echo grace.
+            expectations[index].retiredAt = now()
         }
     }
 
@@ -233,6 +254,8 @@ final class AudioSessionRouteAttribution: @unchecked Sendable {
             guard reason == .categoryChange
                     || reason == .routeConfigurationChange
             else {
+                // Device arrivals, departures, and overrides are external
+                // reality; they invalidate every pending echo credential.
                 invalidateLocked(failClosedTransaction: activeTransaction)
                 return NotificationCapture(
                     generation: generation,
@@ -241,6 +264,7 @@ final class AudioSessionRouteAttribution: @unchecked Sendable {
                     operation: nil
                 )
             }
+            pruneExpiredLocked()
             let activeRevision = activeMutationRevisions.last
             let activeIndex = activeRevision.flatMap { revision in
                 expectations.indices.reversed().first(where: {
@@ -252,8 +276,24 @@ final class AudioSessionRouteAttribution: @unchecked Sendable {
                             || expectations[$0].initialRoute == previousRoute)
                 })
             }
-            guard let index = activeIndex else {
-                invalidateLocked(failClosedTransaction: activeTransaction)
+            // A retired expectation keeps its credential for the delayed-echo
+            // grace, and only for notifications whose own previous-route
+            // payload matches that mutation's exact identity chain. A delayed
+            // notification with no payload has no credential.
+            let delayedIndex = activeIndex ?? previousRoute.flatMap { chain in
+                expectations.indices.reversed().first(where: {
+                    expectations[$0].generation == generation
+                        && expectations[$0].retiredAt != nil
+                        && expectations[$0].capturedReasons.count
+                            < Self.maximumCapturesPerExpectation
+                        && (expectations[$0].initialRoute == chain
+                            || expectations[$0].settledRoute == chain)
+                })
+            }
+            guard let index = delayedIndex else {
+                // An unmatched configuration-reason notification delivers as
+                // external on its own; wiping the remaining credentials here
+                // would turn every later echo external and cascade rebuilds.
                 return NotificationCapture(
                     generation: generation,
                     revision: nil,
@@ -282,23 +322,21 @@ final class AudioSessionRouteAttribution: @unchecked Sendable {
                   let index = expectations.firstIndex(where: {
                       $0.generation == capture.generation
                           && $0.revision == revision
-                  }),
-                  expectations[index].settledRoute == currentRoute
+                  })
             else {
-                invalidateLocked(failClosedTransaction: activeTransaction)
                 return .external
             }
             guard let reasonIndex = expectations[index]
                 .capturedReasons.firstIndex(of: capture.reason)
             else {
-                invalidateLocked(failClosedTransaction: activeTransaction)
                 return .external
             }
             expectations[index].capturedReasons.remove(at: reasonIndex)
-            if expectations[index].capturedReasons.isEmpty,
-               !activeMutationRevisions.contains(revision)
-            {
-                expectations.remove(at: index)
+            // The world moved between capture and delivery: this event
+            // delivers as external, but the other expectations keep their
+            // credentials for their own echoes.
+            guard expectations[index].settledRoute == currentRoute else {
+                return .external
             }
             return .managedConfiguration(capture.operation)
         }
@@ -312,6 +350,14 @@ final class AudioSessionRouteAttribution: @unchecked Sendable {
                 knownRoute = currentRoute
             }
             invalidateLocked(failClosedTransaction: activeTransaction)
+        }
+    }
+
+    private func pruneExpiredLocked() {
+        let currentInstant = now()
+        expectations.removeAll { expectation in
+            guard let retiredAt = expectation.retiredAt else { return false }
+            return currentInstant - retiredAt > Self.delayedEchoGrace
         }
     }
 

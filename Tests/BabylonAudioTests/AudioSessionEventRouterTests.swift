@@ -44,24 +44,85 @@ struct AudioSessionRouteAttributionTests {
         ) == .external)
     }
 
-    @Test("An exact same-route callback captured after mutation end is external")
-    func callbackAfterMutationEndIsExternal() {
+    @Test("A delayed chain-matching echo within grace claims its mutation")
+    func delayedEchoWithinGraceIsManaged() {
         let attribution = makeAttribution()
         let initial = identity(id: "speaker", output: .builtInSpeaker)
         let settled = identity(id: "hfp", output: .bluetoothHFP)
 
+        // AVFoundation delivers echoes on the main queue after the mutation
+        // returned; the credential must survive mutation end.
         attribution.updateKnownRoute(initial)
         let token = attribution.beginMutation(.selectPrivateAccessoryInput)
         attribution.endMutation(token, settledRoute: settled)
-        let capture = attribution.captureNotification(
+        let byInitial = attribution.captureNotification(
             reason: .routeConfigurationChange,
             previousRoute: initial
+        )
+        let bySettled = attribution.captureNotification(
+            reason: .categoryChange,
+            previousRoute: settled
+        )
+
+        #expect(attribution.resolve(
+            byInitial,
+            currentRoute: settled
+        ) == .managedConfiguration(.selectPrivateAccessoryInput))
+        #expect(attribution.resolve(
+            bySettled,
+            currentRoute: settled
+        ) == .managedConfiguration(.selectPrivateAccessoryInput))
+    }
+
+    @Test("A delayed echo after the grace interval is external")
+    func delayedEchoAfterGraceIsExternal() {
+        let clock = ManualAttributionClock()
+        let attribution = AudioSessionRouteAttribution(now: { clock.now })
+        let route = identity(id: "a2dp", output: .bluetoothA2DP)
+
+        attribution.updateKnownRoute(route)
+        let token = attribution.beginMutation(.activate)
+        attribution.endMutation(token, settledRoute: route)
+        clock.advance(
+            by: AudioSessionRouteAttribution.delayedEchoGrace + .seconds(1)
+        )
+        let capture = attribution.captureNotification(
+            reason: .routeConfigurationChange,
+            previousRoute: route
         )
 
         #expect(attribution.resolve(
             capture,
-            currentRoute: settled
+            currentRoute: route
         ) == .external)
+    }
+
+    @Test("An unmatched configuration notification keeps other credentials")
+    func unmatchedConfigurationCaptureKeepsCredentials() {
+        let attribution = makeAttribution()
+        let route = identity(id: "a2dp", output: .bluetoothA2DP)
+        let unrelated = identity(id: "wired", output: .wiredHeadphones)
+
+        attribution.updateKnownRoute(route)
+        let token = attribution.beginMutation(.activate)
+        attribution.endMutation(token, settledRoute: route)
+        let stray = attribution.captureNotification(
+            reason: .categoryChange,
+            previousRoute: unrelated
+        )
+        let echo = attribution.captureNotification(
+            reason: .routeConfigurationChange,
+            previousRoute: route
+        )
+
+        #expect(attribution.resolve(
+            stray,
+            currentRoute: route
+        ) == .external)
+        #expect(attribution.resolve(
+            echo,
+            currentRoute: route
+        ) == .managedConfiguration(.activate))
     }
 
     @Test("Multiple synchronous callbacks can claim one active revision")
@@ -85,6 +146,8 @@ struct AudioSessionRouteAttributionTests {
                 currentRoute: route
             ) == .managedConfiguration(.activate))
         }
+        // Further identity-equal notifications within the grace interval are
+        // delayed echoes of the same mutation, bounded by the capture cap.
         let replay = attribution.captureNotification(
             reason: .routeConfigurationChange,
             previousRoute: route
@@ -92,7 +155,7 @@ struct AudioSessionRouteAttributionTests {
         #expect(attribution.resolve(
             replay,
             currentRoute: route
-        ) == .external)
+        ) == .managedConfiguration(.activate))
     }
 
     @Test("An async window without an exact mutation cannot own an event")
@@ -284,7 +347,7 @@ struct AudioSessionRouteAttributionTests {
         ) == .managedConfiguration(.activate))
     }
 
-    @Test("Callback overflow invalidates the active revision")
+    @Test("Callback overflow fails the overflowing capture, not the revision")
     func boundedCallbackLifecycle() {
         let attribution = makeAttribution()
         let route = identity(id: "a2dp", output: .bluetoothA2DP)
@@ -312,7 +375,7 @@ struct AudioSessionRouteAttributionTests {
             #expect(attribution.resolve(
                 capture,
                 currentRoute: route
-            ) == .external)
+            ) == .managedConfiguration(.activate))
         }
     }
 
@@ -445,4 +508,21 @@ private final class AudioSessionEventRouterRecorder {
     var events: [AudioDeviceEvent] = []
     var observations: [AudioRouteChangeObservation] = []
     var deliveryOrder: [String] = []
+}
+
+private final class ManualAttributionClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var instant = ContinuousClock().now
+
+    var now: ContinuousClock.Instant {
+        lock.lock()
+        defer { lock.unlock() }
+        return instant
+    }
+
+    func advance(by duration: Duration) {
+        lock.lock()
+        defer { lock.unlock() }
+        instant = instant.advanced(by: duration)
+    }
 }

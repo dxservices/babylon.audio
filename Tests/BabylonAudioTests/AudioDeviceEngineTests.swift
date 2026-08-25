@@ -41,7 +41,10 @@ struct AudioDeviceEngineTests {
 
     @Test("Playback completion wait is outside the managed mutation")
     func playbackCompletionWaitDoesNotOwnRouteRevision() async throws {
-        let attribution = AudioSessionRouteAttribution()
+        // A long playback wait outlives the delayed-echo grace; a route
+        // change arriving then is external even with an identical chain.
+        let clock = ManualEngineAttributionClock()
+        let attribution = AudioSessionRouteAttribution(now: { clock.now })
         let route = routeIdentity()
         attribution.updateKnownRoute(route)
         let backend = RecordingDeviceEngineBackend()
@@ -54,6 +57,10 @@ struct AudioDeviceEngineTests {
         try engine.start()
         var capture: AudioSessionRouteAttribution.NotificationCapture?
         backend.onWaitForScheduledPlayback = {
+            clock.advance(
+                by: AudioSessionRouteAttribution.delayedEchoGrace
+                    + .seconds(1)
+            )
             capture = attribution.captureNotification(
                 reason: .routeConfigurationChange,
                 previousRoute: route
@@ -751,5 +758,22 @@ private actor DeviceEngineFailureCounter {
 
     func increment() {
         value += 1
+    }
+}
+
+private final class ManualEngineAttributionClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var instant = ContinuousClock().now
+
+    var now: ContinuousClock.Instant {
+        lock.lock()
+        defer { lock.unlock() }
+        return instant
+    }
+
+    func advance(by duration: Duration) {
+        lock.lock()
+        defer { lock.unlock() }
+        instant = instant.advanced(by: duration)
     }
 }

@@ -77,6 +77,11 @@ All notable changes to this project will be documented in this file.
   stops capture and playback, invalidates both streaming generations,
   deactivates the session, and only then delivers route, interruption, or
   media-reset events.
+- Keep retired mutation revisions claimable for a bounded delayed-echo
+  grace matched by the notification's own previous-route payload, and stop
+  revoking sibling revisions on unmatched configuration notifications, so
+  asynchronously delivered echoes of our own mutations cannot re-enter the
+  safety boundary as external events and cascade rebuilds.
 - Attribute package-owned route notifications only when their callback claims
   an exact active mutation revision, with callback-time previous-route capture
   and exact settled-route matching; mutation-end, ambiguous, overflowed,

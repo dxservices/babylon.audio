@@ -229,17 +229,24 @@ itself never owns a notification. The notification callback performs no
 `AVAudioSession` query: it captures the reason, the system-provided previous
 route identity when present, and at most one exact active revision. A missing
 previous route is accepted only when the callback is
-synchronous with that exact mutation. Once the mutation ends, no notification
-can claim its historical revision. Delivery of an already-captured revision
+synchronous with that exact mutation. Because the system delivers route
+notifications asynchronously on the main queue — always after the mutation
+returned — a retired revision keeps its credential for a bounded delayed-echo
+grace, and a delayed notification claims it only when its own previous-route
+payload equals that mutation's exact before or settled identity. Past the
+grace, or without a payload, no notification can claim a historical revision.
+Delivery of an already-captured revision
 requires the complete current identity (port identifier, name, and kind) to
 equal that mutation's settled route. Such synchronous echoes are reported only
 through the optional content-free observation handler and do not recursively
 enter the safety boundary.
 Everything else is external and fails closed through the device event handler
 into the safety boundary:
-missing or mismatched identities, expectation or callback overflow, device
-arrivals and departures, overrides, wake, unsuitable-route and
-unknown reasons. Interruptions and media-services resets synchronously
+missing, expired, or mismatched identities, expectation or callback
+overflow, device arrivals and departures, overrides, wake, unsuitable-route
+and unknown reasons. An unmatched configuration-reason notification delivers
+externally on its own without revoking the remaining revisions, so one stray
+event cannot cascade every later echo into a rebuild storm. Interruptions and media-services resets synchronously
 invalidate captured revisions. Ambiguity therefore costs at most one
 idempotent safety rebuild, never a silently swallowed external route fact.
 Observations expose only reason, origin, and input/output port kinds, never
