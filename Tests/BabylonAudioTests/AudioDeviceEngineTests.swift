@@ -128,6 +128,44 @@ struct AudioDeviceEngineTests {
         ) == .external)
     }
 
+    @Test("Ready-gated start waits out the invalid hardware format window")
+    func readyGatedStartWaitsForOutputHardware() async throws {
+        let backend = RecordingDeviceEngineBackend()
+        backend.outputHardwareNotReadyPolls = 3
+        let engine = AudioDeviceEngine(backend: backend)
+
+        try await engine.startWhenOutputHardwareReady(
+            settleInterval: .milliseconds(1)
+        )
+
+        #expect(engine.isRunning)
+        #expect(backend.outputHardwareNotReadyPolls == 0)
+    }
+
+    @Test("Ready-gated start retries once after a settle failure")
+    func readyGatedStartRetriesOnce() async throws {
+        let backend = RecordingDeviceEngineBackend()
+        backend.startFailuresRemaining = 1
+        let engine = AudioDeviceEngine(backend: backend)
+
+        try await engine.startWhenOutputHardwareReady(
+            settleInterval: .milliseconds(1),
+            retryDelay: .milliseconds(1)
+        )
+
+        #expect(engine.isRunning)
+
+        // A second consecutive failure propagates.
+        engine.stop()
+        backend.startFailuresRemaining = 2
+        await #expect(throws: AudioDeviceEngineError.self) {
+            try await engine.startWhenOutputHardwareReady(
+                settleInterval: .milliseconds(1),
+                retryDelay: .milliseconds(1)
+            )
+        }
+    }
+
     @Test("Unmute is route-neutral and mints no attribution credential")
     func unmuteMintsNoRouteRevision() throws {
         let attribution = AudioSessionRouteAttribution()
@@ -666,8 +704,21 @@ private final class RecordingDeviceEngineBackend: AudioDeviceEngineBackend {
         playbackCompletions.keys.sorted()
     }
 
+    var outputHardwareNotReadyPolls = 0
+    var startFailuresRemaining = 0
+
+    var outputHardwareIsReady: Bool {
+        guard outputHardwareNotReadyPolls > 0 else { return true }
+        outputHardwareNotReadyPolls -= 1
+        return false
+    }
+
     func start() throws {
         actions.append(.start)
+        if startFailuresRemaining > 0 {
+            startFailuresRemaining -= 1
+            throw AudioDeviceEngineError.engineNotRunning
+        }
     }
 
     func stop() {

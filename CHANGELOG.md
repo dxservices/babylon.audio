@@ -77,6 +77,9 @@ All notable changes to this project will be documented in this file.
   stops capture and playback, invalidates both streaming generations,
   deactivates the session, and only then delivers route, interruption, or
   media-reset events.
+- Add `startWhenOutputHardwareReady` so every consumer starts the engine
+  through the same bounded output-hardware settle wait and single settled
+  retry instead of re-implementing the -10875 workaround.
 - Stop minting attribution credentials for route-neutral engine work:
   per-frame playback scheduling on an attached node and output unmute no
   longer consume bounded expectation capacity, so sustained playback

@@ -264,6 +264,30 @@ public final class AudioDeviceEngine:
         backend.outputHardwareIsReady
     }
 
+    /// Starts the engine after waiting out the transient invalid output
+    /// hardware format that follows a session activation bounce, and gives
+    /// the start one settled retry. Every consumer that starts the engine
+    /// right after route configuration needs this; a bare `start()` inside
+    /// the settle window deterministically fails with -10875.
+    public func startWhenOutputHardwareReady(
+        settleAttempts: Int = 20,
+        settleInterval: Duration = .milliseconds(50),
+        retryDelay: Duration = .milliseconds(200)
+    ) async throws {
+        guard !isRunning else { return }
+        var remaining = settleAttempts
+        while !outputHardwareIsReady, remaining > 0 {
+            remaining -= 1
+            try await Task.sleep(for: settleInterval)
+        }
+        do {
+            try start()
+        } catch {
+            try await Task.sleep(for: retryDelay)
+            try start()
+        }
+    }
+
     public func configurePlayback(format: AudioStreamFormat) throws {
         guard !isRunning else {
             throw AudioDeviceEngineError.engineAlreadyRunning
