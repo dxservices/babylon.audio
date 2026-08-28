@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## 0.1.0 - 2026-08-25
 
 - Add provider-neutral audio frame, source, sink, sender, receiver, event,
   diagnostic, and pipeline-configuration contracts.
