@@ -2,8 +2,9 @@
 
 BabylonAudio is an iOS real-time audio data-plane and device-management Swift package.
 
-The package is pre-0.1 and its provider-neutral contracts and bounded audio core
-are under active development.
+Version 0.1.1 provides provider-neutral contracts, bounded audio pipelines, and
+private-output device management. The 0.x API remains subject to change; pin an
+exact version and review the changelog before upgrading.
 
 ## Requirements
 

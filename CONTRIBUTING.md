@@ -1,6 +1,7 @@
 # Contributing
 
-BabylonAudio is currently in pre-0.1 contract development. Public API stability is not guaranteed.
+BabylonAudio is released in the 0.x series. Public API stability is not guaranteed;
+consumers should pin exact versions and review changes before upgrading.
 
 ## Local checks
 

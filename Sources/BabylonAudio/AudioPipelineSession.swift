@@ -505,7 +505,7 @@ public actor AudioPipelineSession {
             throw AudioPipelineSessionError.deviceRuntimeRequired
         }
         let captureConfiguration = settings.resolve(flowID: generation.flowID)
-        let task = Task { @MainActor [deviceEngine] in
+        let task = Task { @MainActor [weak self, deviceEngine] in
             try deviceEngine.startCaptureOwned(
                 configuration: captureConfiguration,
                 onFrame: { [weak self] frame in

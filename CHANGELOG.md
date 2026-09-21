@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.1.1 - 2026-09-20
+
+- Explicitly capture the pipeline session weakly in the microphone-start task,
+  matching the nested callbacks and passing strict builds with Xcode 27.
+- Correct the release status and document exact-version adoption for the 0.x API.
+- Preserve the 0.1.0 public API, route policy, and bounded audio behavior.
+
 ## 0.1.0 - 2026-08-25
 
 - Add provider-neutral audio frame, source, sink, sender, receiver, event,
